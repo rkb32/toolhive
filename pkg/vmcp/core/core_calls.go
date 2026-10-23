@@ -33,9 +33,10 @@ import (
 // may still reach it.
 //
 // args and meta are treated as read-only and copied before being forwarded
-// (go-style: copy before mutating caller input). The admission decision enforces
-// the same policy ListTools filters on. identity is never logged. See ListTools
-// for the nil/anonymous semantics.
+// (go-style: copy before mutating caller input). The call-side decision is
+// tool:call, which is separate from the tool:read list filter in ListTools, so a
+// tool that is listed but not callable is refused here. identity is never logged.
+// See ListTools for the nil/anonymous semantics.
 func (c *coreVMCP) CallTool(
 	ctx context.Context,
 	identity *auth.Identity,
