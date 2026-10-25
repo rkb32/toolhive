@@ -314,7 +314,10 @@ func authorizeListAndServe(
 	filteringWriter := NewResponseFilteringWriter(
 		w, a, r, parsedRequest.Method, annotationCache, passThroughTools,
 	)
-	next.ServeHTTP(filteringWriter, r)
+	// Transports that deliver the answer after this request returns (SSE) apply
+	// the same filter through the context. Inline transports ignore it.
+	filter := newListResponseFilter(r, a, parsedRequest.Method, annotationCache, passThroughTools)
+	next.ServeHTTP(filteringWriter, r.WithContext(mcp.WithListResponseFilter(r.Context(), filter)))
 
 	if err := filteringWriter.FlushAndFilter(); err != nil {
 		// The response may already be committed, so filtering errors can only be logged here.

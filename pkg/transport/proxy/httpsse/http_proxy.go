@@ -118,6 +118,10 @@ type HTTPSSEProxy struct {
 	// connection regardless of storage backend.
 	liveSSESessions sync.Map
 
+	// pendingListFilters holds the response filters for protected list requests
+	// whose answers arrive later on the SSE stream (see list_filters.go).
+	pendingListFilters pendingListFilters
+
 	// warnedKeys records which fail-closed drop or rejection events have
 	// already been logged at Warn (see warnOnce). Guarded by warnedMutex.
 	warnedKeys  map[string]struct{}
@@ -651,8 +655,57 @@ func (p *HTTPSSEProxy) handleOwnedPostRequest(w http.ResponseWriter, r *http.Req
 		}
 	}
 
+	// A protected list request carries its response filter from the authz
+	// middleware. Record it under the routed ID before the backend can answer,
+	// and refuse the request with 429 when this session has too many outstanding,
+	// or with 503 when its SSE connection is no longer held by this instance.
+	filter := mcp.ListResponseFilterFrom(r.Context())
+	routedKey, hasRoutedKey := routedRequestID(msg)
+	// Any request that reuses the ID of a pending list request is refused, whatever
+	// its method. Otherwise its answer would be taken as the list answer.
+	if hasRoutedKey && p.pendingListFilters.has(sessionID, routedKey) {
+		http.Error(w, "Duplicate outstanding request id", http.StatusConflict)
+		return
+	}
+	isListRequest := filter != nil && hasRoutedKey
+	if isListRequest {
+		alive := func() bool {
+			_, live := p.liveSession(sessionID)
+			return live
+		}
+		if err := p.pendingListFilters.add(sessionID, routedKey, filter, alive); err != nil {
+			if errors.Is(err, errDuplicateListRequest) {
+				http.Error(w, "Duplicate outstanding list request id", http.StatusConflict)
+				return
+			}
+			if errors.Is(err, errExpiredMarkersFull) {
+				// Too many requests timed out for this session. Disconnect it so the
+				// app reconnects and gets an empty table. The 429 goes out first.
+				p.warnOnce("list-markers",
+					"disconnecting SSE session: too many timed-out list requests; the client must reconnect",
+					"session_id", sessionID, "limit", maxExpiredListMarkers)
+				http.Error(w, "Too many timed-out list requests", http.StatusTooManyRequests)
+				p.removeClient(sessionID)
+				return
+			}
+			if errors.Is(err, errTooManyPendingLists) {
+				// Warn once per process, then Debug: a client can hit this at request rate.
+				// The 429 tells the client; a reconnect clears its entries.
+				p.warnOnce("list-cap", "refused protected list request: session has too many outstanding list requests; the session must reconnect to clear them",
+					"session_id", sessionID, "limit", maxPendingListResponses)
+				http.Error(w, "Too many outstanding list requests", http.StatusTooManyRequests)
+				return
+			}
+			http.Error(w, "SSE connection not held by this instance", http.StatusServiceUnavailable)
+			return
+		}
+	}
+
 	// Send the message to the destination
 	if err := p.SendMessageToDestination(msg); err != nil {
+		if isListRequest {
+			p.pendingListFilters.remove(sessionID, routedKey)
+		}
 		http.Error(w, "Failed to send message to destination", http.StatusInternalServerError)
 		return
 	}
@@ -715,6 +768,7 @@ func (p *HTTPSSEProxy) removeClient(clientID string) {
 			sseSession.Disconnect()
 		}
 	}
+	p.pendingListFilters.dropSession(clientID)
 
 	// Remove the session from the manager
 	if err := p.sessionManager.Delete(clientID); err != nil {

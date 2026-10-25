@@ -299,6 +299,12 @@ Then `tools/list` will only show the "weather" tool for that user.
 
 A filtered list depends on the caller's permissions, so `tools/list`, `prompts/list`, and `resources/list` responses carry the HTTP header `Cache-Control: private, no-store`, and a `cacheScope` or `ttlMs` member the backend sent in the result is replaced with `"private"` or `0`. The proxy does not add either member when the backend omitted it, so a list from a backend on an MCP revision that predates these members reaches the client without them. A result that repeats `cacheScope` or `ttlMs`, or spells one with a case-insensitive alias, fails closed with a generic internal JSON-RPC error. `resources/templates/list` responses carry the same header, and their result always includes `cacheScope: "private"` and `ttlMs: 0`.
 
+The SSE transport (`--transport sse`) filters list answers the same way. Before this change, an SSE client received the unfiltered `tools/list`, `prompts/list` and `resources/list` answers, so a tool or prompt it was not permitted to call could appear in the list. Now each answer is filtered for the caller who sent the request. The SSE proxy limits this to:
+
+- **16 outstanding list requests per session.** A request beyond that gets `429 Too Many Requests`. A slot frees after 2 minutes. Reusing the JSON-RPC ID of a list request that is still pending, or timed out and not yet answered, gets `409 Conflict`, whatever the method of the new request.
+- **A 2-minute answer timeout.** If the backend has not answered by then, the request no longer holds a slot, and the client gets no reply. If the backend answers later, the client gets a JSON-RPC internal error with the original ID instead of the list. The client must time out on its own.
+- **64 timed-out requests per session.** When a session reaches this limit, the proxy returns `429 Too Many Requests` and disconnects the SSE stream. The client must reconnect.
+
 ##### Methods covered by a prompt or resource policy
 
 Some MCP methods do not name a capability directly but still act on one. They are
