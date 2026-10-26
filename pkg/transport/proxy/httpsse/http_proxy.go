@@ -656,9 +656,8 @@ func (p *HTTPSSEProxy) handleOwnedPostRequest(w http.ResponseWriter, r *http.Req
 	}
 
 	// A protected list request carries its response filter from the authz
-	// middleware. Record it under the routed ID before the backend can answer,
-	// and refuse the request with 429 when this session has too many outstanding,
-	// or with 503 when its SSE connection is no longer held by this instance.
+	// middleware. recordListRequest records it under the routed ID before the
+	// backend can answer, and writes the refusal when it cannot.
 	filter := mcp.ListResponseFilterFrom(r.Context())
 	routedKey, hasRoutedKey := routedRequestID(msg)
 	// Any request that reuses the ID of a pending list request is refused, whatever
@@ -668,37 +667,8 @@ func (p *HTTPSSEProxy) handleOwnedPostRequest(w http.ResponseWriter, r *http.Req
 		return
 	}
 	isListRequest := filter != nil && hasRoutedKey
-	if isListRequest {
-		alive := func() bool {
-			_, live := p.liveSession(sessionID)
-			return live
-		}
-		if err := p.pendingListFilters.add(sessionID, routedKey, filter, alive); err != nil {
-			if errors.Is(err, errDuplicateListRequest) {
-				http.Error(w, "Duplicate outstanding list request id", http.StatusConflict)
-				return
-			}
-			if errors.Is(err, errExpiredMarkersFull) {
-				// Too many requests timed out for this session. Disconnect it so the
-				// app reconnects and gets an empty table. The 429 goes out first.
-				p.warnOnce("list-markers",
-					"disconnecting SSE session: too many timed-out list requests; the client must reconnect",
-					"session_id", sessionID, "limit", maxExpiredListMarkers)
-				http.Error(w, "Too many timed-out list requests", http.StatusTooManyRequests)
-				p.removeClient(sessionID)
-				return
-			}
-			if errors.Is(err, errTooManyPendingLists) {
-				// Warn once per process, then Debug: a client can hit this at request rate.
-				// The 429 tells the client; a reconnect clears its entries.
-				p.warnOnce("list-cap", "refused protected list request: session has too many outstanding list requests; the session must reconnect to clear them",
-					"session_id", sessionID, "limit", maxPendingListResponses)
-				http.Error(w, "Too many outstanding list requests", http.StatusTooManyRequests)
-				return
-			}
-			http.Error(w, "SSE connection not held by this instance", http.StatusServiceUnavailable)
-			return
-		}
+	if isListRequest && !p.recordListRequest(w, sessionID, routedKey, filter) {
+		return
 	}
 
 	// Send the message to the destination
@@ -834,4 +804,42 @@ func stripSSEEndpointSuffix(prefix string) string {
 	}
 
 	return prefix
+}
+
+// recordListRequest records the response filter of a protected list request
+// under its routed ID before the backend can answer. It returns false, having
+// written the refusal, when the request must not be sent: 409 for a reused ID,
+// 429 when the session has too many outstanding requests (and disconnects it
+// when too many timed out), or 503 when its SSE connection is no longer held.
+func (p *HTTPSSEProxy) recordListRequest(
+	w http.ResponseWriter, sessionID, routedKey string, filter mcp.ListResponseFilter,
+) bool {
+	alive := func() bool {
+		_, live := p.liveSession(sessionID)
+		return live
+	}
+	switch err := p.pendingListFilters.add(sessionID, routedKey, filter, alive); {
+	case err == nil:
+		return true
+	case errors.Is(err, errDuplicateListRequest):
+		http.Error(w, "Duplicate outstanding list request id", http.StatusConflict)
+	case errors.Is(err, errExpiredMarkersFull):
+		// Too many requests timed out for this session. Disconnect it so the
+		// app reconnects and gets an empty table. The 429 goes out first.
+		p.warnOnce("list-markers",
+			"disconnecting SSE session: too many timed-out list requests; the client must reconnect",
+			"session_id", sessionID, "limit", maxExpiredListMarkers)
+		http.Error(w, "Too many timed-out list requests", http.StatusTooManyRequests)
+		p.removeClient(sessionID)
+	case errors.Is(err, errTooManyPendingLists):
+		// Warn once per process, then Debug: a client can hit this at request rate.
+		// The 429 tells the client; a reconnect clears its entries.
+		p.warnOnce("list-cap",
+			"refused protected list request: session has too many outstanding list requests; the session must reconnect to clear them",
+			"session_id", sessionID, "limit", maxPendingListResponses)
+		http.Error(w, "Too many outstanding list requests", http.StatusTooManyRequests)
+	default:
+		http.Error(w, "SSE connection not held by this instance", http.StatusServiceUnavailable)
+	}
+	return false
 }
