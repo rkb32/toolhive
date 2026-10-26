@@ -35,7 +35,7 @@ jobs:
 
   operator-tests-integration:
     name: Operator Tests Integration
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-8cores-32gb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -152,7 +152,7 @@ jobs:
 
   e2e-tests-operator:
     name: E2E Tests Operator
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-8cores-32gb
     timeout-minutes: 30
     defaults:
       run:

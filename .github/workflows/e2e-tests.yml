@@ -9,7 +9,7 @@ permissions:
 jobs:
   build-binary:
     name: Build ToolHive Binary
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-8cores-32gb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -47,7 +47,7 @@ jobs:
     # only a couple of minutes are container- and network-bound rather than
     # CPU-bound, and set `runner` to the standard runner, which is free for
     # this public repo. Long shards keep the large runner for wall time.
-    runs-on: ${{ matrix.runner || 'ubuntu-latest' }}
+    runs-on: ${{ matrix.runner || 'ubuntu-8cores-32gb' }}
     needs: build-binary
     strategy:
       fail-fast: false
