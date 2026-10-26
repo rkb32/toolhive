@@ -655,19 +655,8 @@ func (p *HTTPSSEProxy) handleOwnedPostRequest(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	// A protected list request carries its response filter from the authz
-	// middleware. recordListRequest records it under the routed ID before the
-	// backend can answer, and writes the refusal when it cannot.
-	filter := mcp.ListResponseFilterFrom(r.Context())
-	routedKey, hasRoutedKey := routedRequestID(msg)
-	// Any request that reuses the ID of a pending list request is refused, whatever
-	// its method. Otherwise its answer would be taken as the list answer.
-	if hasRoutedKey && p.pendingListFilters.has(sessionID, routedKey) {
-		http.Error(w, "Duplicate outstanding request id", http.StatusConflict)
-		return
-	}
-	isListRequest := filter != nil && hasRoutedKey
-	if isListRequest && !p.recordListRequest(w, sessionID, routedKey, filter) {
+	routedKey, isListRequest, ok := p.admitRequest(w, r, sessionID, msg)
+	if !ok {
 		return
 	}
 
@@ -842,4 +831,25 @@ func (p *HTTPSSEProxy) recordListRequest(
 		http.Error(w, "SSE connection not held by this instance", http.StatusServiceUnavailable)
 	}
 	return false
+}
+
+// admitRequest decides whether a request may be sent to the backend, and records
+// its response filter when it is a protected list request. It returns the routed
+// ID and whether the request is a list request. When ok is false it has already
+// written the refusal. The checks run in this order: a reused ID is refused for
+// any method; then a protected list request is recorded (see recordListRequest).
+func (p *HTTPSSEProxy) admitRequest(
+	w http.ResponseWriter, r *http.Request, sessionID string, msg jsonrpc2.Message,
+) (routedKey string, isListRequest, ok bool) {
+	filter := mcp.ListResponseFilterFrom(r.Context())
+	routedKey, hasRoutedKey := routedRequestID(msg)
+	if hasRoutedKey && p.pendingListFilters.has(sessionID, routedKey) {
+		http.Error(w, "Duplicate outstanding request id", http.StatusConflict)
+		return "", false, false
+	}
+	isListRequest = filter != nil && hasRoutedKey
+	if isListRequest && !p.recordListRequest(w, sessionID, routedKey, filter) {
+		return "", false, false
+	}
+	return routedKey, isListRequest, true
 }

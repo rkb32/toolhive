@@ -185,8 +185,8 @@ func (p *HTTPSSEProxy) routeResponse(resp *jsonrpc2.Response) error {
 	filter, state := p.pendingListFilters.take(sessionID, routedID)
 	switch state {
 	case pendingNone:
-			// Not a protected list request: the answer is delivered as it is.
-		case pendingLive:
+		// Not a protected list request: the answer is delivered as it is.
+	case pendingLive:
 		restored = filter(restored)
 	case pendingExpired:
 		slog.Debug("replacing late list response for a timed-out request with an error", "session_id", sessionID)
