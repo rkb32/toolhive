@@ -207,6 +207,15 @@ func Middleware(a authorizers.Authorizer, next http.Handler, passThroughTools ma
 	annotationCache := NewAnnotationCache()
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A GET opens the server-to-client event stream. Its list answers are
+		// filtered per event as they arrive, by the shape of each result.
+		if r.Method == http.MethodGet {
+			stream := newSSEStreamFilterWriter(w, a, r, annotationCache, passThroughTools)
+			next.ServeHTTP(stream, r)
+			stream.finish()
+			return
+		}
+
 		// Check if we should skip authorization before checking parsed data
 		if shouldSkipInitialAuthorization(r) {
 			next.ServeHTTP(w, r)
@@ -314,10 +323,7 @@ func authorizeListAndServe(
 	filteringWriter := NewResponseFilteringWriter(
 		w, a, r, parsedRequest.Method, annotationCache, passThroughTools,
 	)
-	// Transports that deliver the answer after this request returns (SSE) apply
-	// the same filter through the context. Inline transports ignore it.
-	filter := newListResponseFilter(r, a, parsedRequest.Method, annotationCache, passThroughTools)
-	next.ServeHTTP(filteringWriter, r.WithContext(mcp.WithListResponseFilter(r.Context(), filter)))
+	next.ServeHTTP(filteringWriter, r)
 
 	if err := filteringWriter.FlushAndFilter(); err != nil {
 		// The response may already be committed, so filtering errors can only be logged here.

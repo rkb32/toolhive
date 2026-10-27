@@ -13,7 +13,6 @@ import (
 
 	"golang.org/x/exp/jsonrpc2"
 
-	"github.com/stacklok/toolhive/pkg/mcp"
 	"github.com/stacklok/toolhive/pkg/transport/session"
 	"github.com/stacklok/toolhive/pkg/transport/ssecommon"
 )
@@ -161,9 +160,7 @@ func requestIDParam(v any) (jsonrpc2.ID, bool) {
 // ID it carries, with the client's original ID restored. Anything else is
 // dropped at Debug: an ID the proxy never minted (a health-check ping echo, or
 // a backend inventing IDs), or a session that disconnected before its
-// response arrived. Dropped responses are never queued or broadcast. A protected list request
-// whose answer arrives after pendingListTimeout gets a JSON-RPC error with the
-// client's ID, not the backend's list.
+// response arrived. Dropped responses are never queued or broadcast.
 func (p *HTTPSSEProxy) routeResponse(resp *jsonrpc2.Response) error {
 	sessionID, originalID, ok := decodeRoutedID(resp.ID)
 	if !ok {
@@ -177,24 +174,6 @@ func (p *HTTPSSEProxy) routeResponse(resp *jsonrpc2.Response) error {
 	}
 
 	restored := &jsonrpc2.Response{ID: originalID, Result: resp.Result, Error: resp.Error}
-	// A protected list request is filtered for this caller when its answer is routed,
-	// as the streamable path does. The filter runs on the restored ID so the
-	// error envelope it may return carries the client's own ID. A request that
-	// timed out is never sent as the backend's list: the client gets an error.
-	routedID, _ := resp.ID.Raw().(string)
-	filter, state := p.pendingListFilters.take(sessionID, routedID)
-	switch state {
-	case pendingNone:
-		// Not a protected list request: the answer is delivered as it is.
-	case pendingLive:
-		restored = filter(restored)
-	case pendingExpired:
-		slog.Debug("replacing late list response for a timed-out request with an error", "session_id", sessionID)
-		restored = &jsonrpc2.Response{
-			ID:    originalID,
-			Error: jsonrpc2.NewError(mcp.CodeInternalError, "list request timed out"),
-		}
-	}
 	data, err := jsonrpc2.EncodeMessage(restored)
 	if err != nil {
 		return fmt.Errorf("failed to encode JSON-RPC response: %w", err)

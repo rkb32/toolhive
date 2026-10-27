@@ -118,10 +118,6 @@ type HTTPSSEProxy struct {
 	// connection regardless of storage backend.
 	liveSSESessions sync.Map
 
-	// pendingListFilters holds the response filters for protected list requests
-	// whose answers arrive later on the SSE stream (see list_filters.go).
-	pendingListFilters pendingListFilters
-
 	// warnedKeys records which fail-closed drop or rejection events have
 	// already been logged at Warn (see warnOnce). Guarded by warnedMutex.
 	warnedKeys  map[string]struct{}
@@ -655,16 +651,8 @@ func (p *HTTPSSEProxy) handleOwnedPostRequest(w http.ResponseWriter, r *http.Req
 		}
 	}
 
-	routedKey, isListRequest, ok := p.admitRequest(w, r, sessionID, msg)
-	if !ok {
-		return
-	}
-
 	// Send the message to the destination
 	if err := p.SendMessageToDestination(msg); err != nil {
-		if isListRequest {
-			p.pendingListFilters.remove(sessionID, routedKey)
-		}
 		http.Error(w, "Failed to send message to destination", http.StatusInternalServerError)
 		return
 	}
@@ -727,7 +715,6 @@ func (p *HTTPSSEProxy) removeClient(clientID string) {
 			sseSession.Disconnect()
 		}
 	}
-	p.pendingListFilters.dropSession(clientID)
 
 	// Remove the session from the manager
 	if err := p.sessionManager.Delete(clientID); err != nil {
@@ -793,63 +780,4 @@ func stripSSEEndpointSuffix(prefix string) string {
 	}
 
 	return prefix
-}
-
-// recordListRequest records the response filter of a protected list request
-// under its routed ID before the backend can answer. It returns false, having
-// written the refusal, when the request must not be sent: 409 for a reused ID,
-// 429 when the session has too many outstanding requests (and disconnects it
-// when too many timed out), or 503 when its SSE connection is no longer held.
-func (p *HTTPSSEProxy) recordListRequest(
-	w http.ResponseWriter, sessionID, routedKey string, filter mcp.ListResponseFilter,
-) bool {
-	alive := func() bool {
-		_, live := p.liveSession(sessionID)
-		return live
-	}
-	switch err := p.pendingListFilters.add(sessionID, routedKey, filter, alive); {
-	case err == nil:
-		return true
-	case errors.Is(err, errDuplicateListRequest):
-		http.Error(w, "Duplicate outstanding list request id", http.StatusConflict)
-	case errors.Is(err, errExpiredMarkersFull):
-		// Too many requests timed out for this session. Disconnect it so the
-		// app reconnects and gets an empty table. The 429 goes out first.
-		p.warnOnce("list-markers",
-			"disconnecting SSE session: too many timed-out list requests; the client must reconnect",
-			"session_id", sessionID, "limit", maxExpiredListMarkers)
-		http.Error(w, "Too many timed-out list requests", http.StatusTooManyRequests)
-		p.removeClient(sessionID)
-	case errors.Is(err, errTooManyPendingLists):
-		// Warn once per process, then Debug: a client can hit this at request rate.
-		// The 429 tells the client; a reconnect clears its entries.
-		p.warnOnce("list-cap",
-			"refused protected list request: session has too many outstanding list requests; the session must reconnect to clear them",
-			"session_id", sessionID, "limit", maxPendingListResponses)
-		http.Error(w, "Too many outstanding list requests", http.StatusTooManyRequests)
-	default:
-		http.Error(w, "SSE connection not held by this instance", http.StatusServiceUnavailable)
-	}
-	return false
-}
-
-// admitRequest decides whether a request may be sent to the backend, and records
-// its response filter when it is a protected list request. It returns the routed
-// ID and whether the request is a list request. When ok is false it has already
-// written the refusal. The checks run in this order: a reused ID is refused for
-// any method; then a protected list request is recorded (see recordListRequest).
-func (p *HTTPSSEProxy) admitRequest(
-	w http.ResponseWriter, r *http.Request, sessionID string, msg jsonrpc2.Message,
-) (routedKey string, isListRequest, ok bool) {
-	filter := mcp.ListResponseFilterFrom(r.Context())
-	routedKey, hasRoutedKey := routedRequestID(msg)
-	if hasRoutedKey && p.pendingListFilters.has(sessionID, routedKey) {
-		http.Error(w, "Duplicate outstanding request id", http.StatusConflict)
-		return "", false, false
-	}
-	isListRequest = filter != nil && hasRoutedKey
-	if isListRequest && !p.recordListRequest(w, sessionID, routedKey, filter) {
-		return "", false, false
-	}
-	return routedKey, isListRequest, true
 }
