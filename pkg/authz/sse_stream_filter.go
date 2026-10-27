@@ -102,7 +102,7 @@ func (w *sseStreamFilterWriter) finish() {
 	if len(trailing) == 0 {
 		return
 	}
-	if _, err := w.writeLines(w.processLines(parseSSELines(trailing))); err != nil {
+	if err := w.writeLines(w.processLines(parseSSELines(trailing))); err != nil {
 		slog.Error("error writing filtered SSE stream", "error", err)
 	}
 }
@@ -127,26 +127,20 @@ func (w *sseStreamFilterWriter) drainCompleteEvents() error {
 	}
 	chunk := w.buffer[:end]
 	w.buffer = w.buffer[end:]
-	_, err := w.writeLines(w.processLines(parseSSELines(chunk)))
-	return err
+	return w.writeLines(w.processLines(parseSSELines(chunk)))
 }
 
 // writeLines writes each line with the terminator it was read with.
-func (w *sseStreamFilterWriter) writeLines(lines []sseLine) (int, error) {
-	var written int
+func (w *sseStreamFilterWriter) writeLines(lines []sseLine) error {
 	for _, l := range lines {
-		n, err := w.ResponseWriter.Write(l.text)
-		written += n
-		if err != nil {
-			return written, err
+		if _, err := w.ResponseWriter.Write(l.text); err != nil {
+			return err
 		}
-		n, err = w.ResponseWriter.Write(l.term)
-		written += n
-		if err != nil {
-			return written, err
+		if _, err := w.ResponseWriter.Write(l.term); err != nil {
+			return err
 		}
 	}
-	return written, nil
+	return nil
 }
 
 // processLines filters each event in lines. Blank lines separate events and
