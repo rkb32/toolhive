@@ -73,6 +73,25 @@ const (
 // purpose entirely, so it is never used as the enforced minimum.
 const DefaultDeviceCodeInterval = 5 * time.Second
 
+// Values for AuthorizationServerConfig.AccessTokenType and AuthorizationServerParams.AccessTokenType.
+const (
+	// AccessTokenTypeJWT is the default JOSE "typ" header for JWT access tokens, the value fosite writes.
+	AccessTokenTypeJWT = "JWT"
+	// AccessTokenTypeATJWT is the RFC 9068 §2.1 media type for JWT access tokens.
+	AccessTokenTypeATJWT = "at+jwt"
+)
+
+// ValidateAccessTokenType accepts the empty string (meaning AccessTokenTypeJWT),
+// AccessTokenTypeJWT and AccessTokenTypeATJWT. Matching is exact and case-sensitive.
+func ValidateAccessTokenType(typ string) error {
+	switch typ {
+	case "", AccessTokenTypeJWT, AccessTokenTypeATJWT:
+		return nil
+	default:
+		return fmt.Errorf("unsupported access token type %q: must be %q or %q", typ, AccessTokenTypeJWT, AccessTokenTypeATJWT)
+	}
+}
+
 // AuthorizationServerConfig wraps fosite.Config with additional configuration
 // for JWT signing and other extensions.
 type AuthorizationServerConfig struct {
@@ -87,6 +106,10 @@ type AuthorizationServerConfig struct {
 	// https://toolhive.dev/upstream_subject claim on login-derived access tokens.
 	// It is not an access-control or audience-grant setting.
 	SubjectIdentifierAudiences []string
+	// AccessTokenType is the JOSE "typ" header set on JWT access tokens. It is always
+	// AccessTokenTypeJWT or AccessTokenTypeATJWT, never empty: NewAuthorizationServerConfig
+	// sets an empty value to AccessTokenTypeJWT. It applies to access tokens only.
+	AccessTokenType string
 	// ScopesSupported lists the OAuth 2.0 scope values advertised in discovery documents.
 	// This is advertised in /.well-known/openid-configuration and
 	// /.well-known/oauth-authorization-server discovery endpoints.
@@ -195,6 +218,10 @@ type AuthorizationServerParams struct {
 	// https://toolhive.dev/upstream_subject claim on login-derived access tokens.
 	// It is not an access-control or audience-grant setting.
 	SubjectIdentifierAudiences []string
+	// AccessTokenType sets the JOSE "typ" header on every JWT access token this server issues;
+	// one of AccessTokenTypeJWT (default) or AccessTokenTypeATJWT. An empty value means
+	// AccessTokenTypeJWT. It affects access tokens only, never other JWTs the server signs.
+	AccessTokenType string
 	// ScopesSupported lists the OAuth 2.0 scope values advertised in discovery documents.
 	ScopesSupported []string
 	// BaselineClientScopes is a baseline set of OAuth 2.0 scopes the DCR handler
@@ -329,7 +356,8 @@ func validateTokenLifespans(cfg *AuthorizationServerParams) error {
 
 // ValidateConfidentialClientTransport rejects cleartext HTTP configurations
 // when any confidential client is enabled, whether it is admitted through DCR
-// or statically declared.
+// or statically declared. Statically declared delegate clients always count,
+// regardless of their authentication method.
 func ValidateConfidentialClientTransport(
 	allowConfidential, insecureAllowHTTP bool,
 	issuer string, insecureAllowConfidentialOverLoopbackHTTP bool,
@@ -338,8 +366,9 @@ func ValidateConfidentialClientTransport(
 		return nil
 	}
 	if insecureAllowHTTP {
-		return fmt.Errorf("allow_confidential_client_registration cannot be combined with insecure_allow_http: " +
-			"confidential clients would send secrets over cleartext HTTP")
+		return fmt.Errorf("confidential clients (allow_confidential_client_registration or delegate clients) " +
+			"cannot be combined with insecure_allow_http: " +
+			"client credentials, authorization codes and tokens would cross cleartext HTTP")
 	}
 	parsed, err := url.Parse(issuer)
 	if err != nil {
@@ -357,16 +386,20 @@ func ValidateConfidentialClientTransport(
 		return fmt.Errorf("confidential clients require a valid issuer URL")
 	}
 	if insecureAllowConfidentialOverLoopbackHTTP && !networking.IsLocalhost(parsed.Host) {
-		return fmt.Errorf("allow_confidential_client_registration cannot use the loopback HTTP opt-in with a non-loopback issuer: " +
-			"confidential clients would send secrets over cleartext HTTP")
+		return fmt.Errorf("confidential clients (allow_confidential_client_registration or delegate clients) " +
+			"cannot use the loopback HTTP opt-in with a non-loopback issuer: " +
+			"client credentials, authorization codes and tokens would cross cleartext HTTP")
 	}
 	if !insecureAllowConfidentialOverLoopbackHTTP && networking.IsLocalhost(parsed.Host) {
-		return fmt.Errorf("allow_confidential_client_registration cannot be combined with a plain-HTTP loopback issuer unless " +
-			"insecure_allow_confidential_over_loopback_http is set: confidential clients would send secrets over cleartext HTTP")
+		return fmt.Errorf("confidential clients (allow_confidential_client_registration or delegate clients) " +
+			"cannot be combined with a plain-HTTP loopback issuer unless " +
+			"insecure_allow_confidential_over_loopback_http is set: " +
+			"client credentials, authorization codes and tokens would cross cleartext HTTP")
 	}
 	if !networking.IsLocalhost(parsed.Host) {
-		return fmt.Errorf("allow_confidential_client_registration cannot use a plain-HTTP non-loopback issuer: " +
-			"confidential clients would send secrets over cleartext HTTP")
+		return fmt.Errorf("confidential clients (allow_confidential_client_registration or delegate clients) " +
+			"cannot use a plain-HTTP non-loopback issuer: " +
+			"client credentials, authorization codes and tokens would cross cleartext HTTP")
 	}
 	return nil
 }
@@ -403,6 +436,9 @@ func validateParams(cfg *AuthorizationServerParams) error {
 		return err
 	}
 	if err := ValidateSubjectIdentifierAudiences(cfg.SubjectIdentifierAudiences, cfg.AllowedAudiences); err != nil {
+		return err
+	}
+	if err := ValidateAccessTokenType(cfg.AccessTokenType); err != nil {
 		return err
 	}
 	if err := ValidateConfidentialClientTransport(
@@ -487,12 +523,20 @@ func NewAuthorizationServerConfig(cfg *AuthorizationServerParams) (*Authorizatio
 		ClientSecretsHasher: registration.SHA256Hasher,
 	}
 
+	accessTokenType := func() string {
+		if cfg.AccessTokenType == "" {
+			return AccessTokenTypeJWT
+		}
+		return cfg.AccessTokenType
+	}()
+
 	return &AuthorizationServerConfig{
 		Config:                                    fositeConfig,
 		SigningKey:                                &jwk,
 		SigningJWKS:                               signingJWKS,
 		AllowedAudiences:                          cfg.AllowedAudiences,
 		SubjectIdentifierAudiences:                cfg.SubjectIdentifierAudiences,
+		AccessTokenType:                           accessTokenType,
 		ScopesSupported:                           cfg.ScopesSupported,
 		BaselineClientScopes:                      cfg.BaselineClientScopes,
 		AuthorizationEndpointBaseURL:              cfg.AuthorizationEndpointBaseURL,
@@ -550,7 +594,7 @@ func NewAuthorizationServer(
 	fositeConfig.RevocationHandlers = slices.Clone(fositeConfig.RevocationHandlers)
 	fositeConfig.PushedAuthorizeEndpointHandlers = slices.Clone(fositeConfig.PushedAuthorizeEndpointHandlers)
 	providerConfig.Config = &fositeConfig
-	provider := fosite.NewOAuth2Provider(storage, &fositeConfig)
+	provider := fosite.NewOAuth2Provider(storage, newClientAssertionAudienceConfig(&fositeConfig))
 	// Select the fallback after constructing the provider because fosite's
 	// built-in strategy is a provider method. Preserve a caller-supplied strategy
 	// when present, then install the SPIFFE dispatcher on the provider-local copy.
