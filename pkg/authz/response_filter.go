@@ -152,37 +152,28 @@ func (rfw *ResponseFilteringWriter) FlushAndFilter() error {
 		// result, process it exactly as if it had been labeled correctly
 		// (which filters clean frames and fails closed on dirty ones). Only a
 		// body carrying no result under either shape passes through.
-		switch sniffBodyShape(rawResponse) {
-		case bodyShapeJSON:
+		action, _ := classifyUnlabeledBody(rawResponse)
+		switch action {
+		case sniffFilterJSON, sniffRejectJSON:
 			slog.Warn("response with unrecognized media type carries a JSON-RPC result; filtering as JSON",
 				"method", rfw.method, "contentType", contentType)
 			rfw.ResponseWriter.Header().Del("Content-Length")
 			return rfw.processJSONResponse(rawResponse)
-		case bodyShapeSSE:
-			slog.Warn("response with unrecognized media type carries a JSON-RPC result; filtering as SSE",
-				"method", rfw.method, "contentType", contentType)
+		case sniffFilterSSE:
 			rfw.ResponseWriter.Header().Del("Content-Length")
 			return rfw.processSSEResponse(rawResponse)
-		case bodyShapeNone:
-			// A body that cannot be decoded and names a result is rejected, not passed on.
-			_, derr := jsonrpc2.DecodeMessage(rawResponse)
-			switch decideNoShapeBody(rawResponse, derr != nil) {
-			case noShapeFilterSSE:
-				rfw.ResponseWriter.Header().Del("Content-Length")
-				return rfw.processSSEResponse(rawResponse)
-			case noShapeReject:
-				slog.Warn("response with unrecognized media type names a result that could not be decoded; dropping",
-					"method", rfw.method, "contentType", contentType)
-				// Answer with the request id. If none is on the request, use the body's own id.
-				id := rfw.requestID()
-				if id == (jsonrpc2.ID{}) {
-					id = topLevelID(rawResponse)
-				}
-				return rfw.writeErrorResponse(id,
-					errors.New("dropped a frame carrying a result outside a clean Response"))
-			case noShapePassThrough:
-				// Falls through to the unchanged write below.
+		case sniffRejectNamed:
+			slog.Warn("response with unrecognized media type names a result that could not be decoded; dropping",
+				"method", rfw.method, "contentType", contentType)
+			// Answer with the request id. If none is on the request, use the body's own id.
+			id := rfw.requestID()
+			if id == (jsonrpc2.ID{}) {
+				id = topLevelID(rawResponse)
 			}
+			return rfw.writeErrorResponse(id,
+				errors.New("dropped a frame carrying a result outside a clean Response"))
+		case sniffPassThrough:
+			// Falls through to the unchanged write below.
 		}
 		// The leading BOM was removed above, so the backend's Content-Length
 		// is now three bytes too large even though this fallback doesn't filter
@@ -858,6 +849,52 @@ func decideNoShapeBody(body []byte, rejectNamed bool) noShapeAction {
 		return noShapeReject
 	}
 	return noShapePassThrough
+}
+
+// sniffAction is the decision for a 2xx body whose media type is neither
+// application/json nor text/event-stream. classifyUnlabeledBody makes it once, for
+// both the POST path and the GET stream. Each caller then acts on it with its own
+// writer and request id.
+type sniffAction int
+
+const (
+	// sniffFilterJSON: a clean JSON-RPC Response, filtered as one.
+	sniffFilterJSON sniffAction = iota
+	// sniffRejectJSON: a JSON body carries a result that is not a clean Response.
+	sniffRejectJSON
+	// sniffFilterSSE: the body is filtered per event.
+	sniffFilterSSE
+	// sniffRejectNamed: the body names a result that cannot be decoded.
+	sniffRejectNamed
+	// sniffPassThrough: no result in either shape, so the body is written unchanged.
+	sniffPassThrough
+)
+
+// classifyUnlabeledBody picks the action for such a body. It checks the shape first,
+// in the order the POST path always used. A clean Response is returned decoded, so
+// a caller does not decode it twice.
+func classifyUnlabeledBody(body []byte) (sniffAction, *jsonrpc2.Response) {
+	switch sniffBodyShape(body) {
+	case bodyShapeJSON:
+		message, _ := jsonrpc2.DecodeMessage(body)
+		if response, ok := message.(*jsonrpc2.Response); ok {
+			return sniffFilterJSON, response
+		}
+		return sniffRejectJSON, nil
+	case bodyShapeSSE:
+		return sniffFilterSSE, nil
+	case bodyShapeNone:
+	}
+	_, derr := jsonrpc2.DecodeMessage(body)
+	switch decideNoShapeBody(body, derr != nil) {
+	case noShapeFilterSSE:
+		return sniffFilterSSE, nil
+	case noShapeReject:
+		return sniffRejectNamed, nil
+	case noShapePassThrough:
+		return sniffPassThrough, nil
+	}
+	return sniffPassThrough, nil
 }
 
 // filterListResponse filters the list response based on authorization policies
