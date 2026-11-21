@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"maps"
 	"reflect"
+	"slices"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -43,6 +45,9 @@ type MCPRemoteProxyReconciler struct {
 	Scheme           *runtime.Scheme
 	Recorder         events.EventRecorder
 	PlatformDetector *ctrlutil.SharedPlatformDetector
+	// DefaultRedisConfig is the read-only global Redis snapshot loaded at startup.
+	// Nil means no global fallback is configured.
+	DefaultRedisConfig *ctrlutil.DefaultRedisConfig
 	// ImagePullSecretsDefaults are cluster-wide defaults sourced from the
 	// operator chart that are merged with the per-CR imagePullSecrets when
 	// constructing workloads. The zero value is a usable empty Defaults.
@@ -590,12 +595,19 @@ func (r *MCPRemoteProxyReconciler) ensureService(
 ) (ctrl.Result, error) {
 	ctxLogger := log.FromContext(ctx)
 
+	tlsListener, err := ctrlutil.ResolveTLSListenerEnabled(
+		ctx, r.Client, proxy.Namespace, proxy.Spec.ExternalAuthConfigRef, proxy.Spec.AuthServerRef,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	serviceName := createProxyServiceName(proxy.Name)
 	service := &corev1.Service{}
-	err := r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: proxy.Namespace}, service)
+	err = r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: proxy.Namespace}, service)
 
 	if errors.IsNotFound(err) {
-		svc := r.serviceForMCPRemoteProxy(ctx, proxy)
+		svc := r.serviceForMCPRemoteProxy(ctx, proxy, tlsListener)
 		if svc == nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create Service object")
 		}
@@ -611,8 +623,8 @@ func (r *MCPRemoteProxyReconciler) ensureService(
 	}
 
 	// Service exists - check if it needs to be updated
-	if r.serviceNeedsUpdate(service, proxy) {
-		newService := r.serviceForMCPRemoteProxy(ctx, proxy)
+	if r.serviceNeedsUpdate(service, proxy, tlsListener) {
+		newService := r.serviceForMCPRemoteProxy(ctx, proxy, tlsListener)
 		if newService == nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create updated Service object")
 		}
@@ -1640,24 +1652,31 @@ func (r *MCPRemoteProxyReconciler) updateMCPRemoteProxyStatus(ctx context.Contex
 		return err
 	}
 
-	// Update the status based on the pod status
+	// Update the status based on the pod status. The classifier is shared with
+	// the MCPServer reconciler so that both CRDs report the same verdict for the
+	// same pod: a pod in the Running phase whose container is not ready, or one
+	// in CrashLoopBackOff, is not a proxy that can serve traffic (#6726).
 	var running, pending, failed int
+	var failureReasons []string
 	for _, pod := range podList.Items {
-		switch pod.Status.Phase {
-		case corev1.PodRunning:
-			running++
-		case corev1.PodPending:
-			pending++
-		case corev1.PodFailed:
-			failed++
-		case corev1.PodSucceeded:
-			running++
-		case corev1.PodUnknown:
-			pending++
+		podRunning, podPending, podFailed, reason := categorizePodStatus(pod)
+		running += podRunning
+		pending += podPending
+		failed += podFailed
+		// categorizePodStatus returns a reason with a failed pod only; the
+		// guard keeps a future pending reason from reaching the Failed message.
+		if podFailed > 0 && reason != "" {
+			failureReasons = append(failureReasons, reason)
 		}
 	}
+	if len(failureReasons) > 0 {
+		slices.Sort(failureReasons)
+		failureReasons = slices.Compact(failureReasons)
+	}
 
-	// Update the status
+	// Update the status. A Ready replica keeps a proxy routable even while a
+	// second replica crash-loops, which is the MCPServer verdict too; the
+	// failure branch only wins when no replica is ready.
 	if running > 0 {
 		proxy.Status.Phase = mcpv1beta1.MCPRemoteProxyPhaseReady
 		proxy.Status.Message = "Remote proxy is running"
@@ -1668,6 +1687,19 @@ func (r *MCPRemoteProxyReconciler) updateMCPRemoteProxyStatus(ctx context.Contex
 			Message:            "Deployment is ready and running",
 			ObservedGeneration: proxy.Generation,
 		})
+	} else if failed > 0 {
+		proxy.Status.Phase = mcpv1beta1.MCPRemoteProxyPhaseFailed
+		proxy.Status.Message = "Remote proxy failed to start"
+		if len(failureReasons) > 0 {
+			proxy.Status.Message = fmt.Sprintf("Remote proxy failed to start: %s", strings.Join(failureReasons, ", "))
+		}
+		meta.SetStatusCondition(&proxy.Status.Conditions, metav1.Condition{
+			Type:               mcpv1beta1.ConditionTypeReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             mcpv1beta1.ConditionReasonDeploymentNotReady,
+			Message:            proxy.Status.Message,
+			ObservedGeneration: proxy.Generation,
+		})
 	} else if pending > 0 {
 		proxy.Status.Phase = mcpv1beta1.MCPRemoteProxyPhasePending
 		proxy.Status.Message = "Remote proxy is starting"
@@ -1676,16 +1708,6 @@ func (r *MCPRemoteProxyReconciler) updateMCPRemoteProxyStatus(ctx context.Contex
 			Status:             metav1.ConditionFalse,
 			Reason:             mcpv1beta1.ConditionReasonDeploymentNotReady,
 			Message:            "Deployment is not yet ready",
-			ObservedGeneration: proxy.Generation,
-		})
-	} else if failed > 0 {
-		proxy.Status.Phase = mcpv1beta1.MCPRemoteProxyPhaseFailed
-		proxy.Status.Message = "Remote proxy failed to start"
-		meta.SetStatusCondition(&proxy.Status.Conditions, metav1.Condition{
-			Type:               mcpv1beta1.ConditionTypeReady,
-			Status:             metav1.ConditionFalse,
-			Reason:             mcpv1beta1.ConditionReasonDeploymentNotReady,
-			Message:            "Deployment failed",
 			ObservedGeneration: proxy.Generation,
 		})
 	} else {
@@ -1846,13 +1868,24 @@ func (r *MCPRemoteProxyReconciler) generatedContainerNeedsUpdate(
 ) bool {
 	container := deployment.Spec.Template.Spec.Containers[0]
 
+	tlsListener, err := ctrlutil.ResolveTLSListenerEnabled(
+		ctx, r.Client, proxy.Namespace, proxy.Spec.ExternalAuthConfigRef, proxy.Spec.AuthServerRef,
+	)
+	if err != nil {
+		return true
+	}
+
 	// Check if runner image has changed
 	if container.Image != getToolhiveRunnerImage() {
 		return true
 	}
 
-	// Check if port has changed
-	if len(container.Ports) > 0 && container.Ports[0].ContainerPort != int32(proxy.GetProxyPort()) {
+	// Check if the operator-owned ports have changed
+	if ctrlutil.ContainerPortsDrifted(
+		container.Ports,
+		ctrlutil.ProxyContainerPorts(int32(proxy.GetProxyPort()), tlsListener),
+		ctrlutil.ProxyContainerPorts(int32(proxy.GetProxyPort()), true),
+	) {
 		return true
 	}
 
@@ -1874,9 +1907,13 @@ func (r *MCPRemoteProxyReconciler) generatedContainerNeedsUpdate(
 		return true
 	}
 
-	// Check if resources have changed
-	expectedResources := ctrlutil.BuildResourceRequirements(proxy.Spec.Resources)
-	if !reflect.DeepEqual(container.Resources, expectedResources) {
+	// Check if resources have changed. Use the same default+override merge as
+	// deployment generation so drift detection stays consistent.
+	expectedResources, err := resourceRequirementsForRemoteProxy(proxy)
+	if err != nil {
+		return true
+	}
+	if !equality.Semantic.DeepEqual(container.Resources, expectedResources) {
 		return true
 	}
 
@@ -1975,17 +2012,17 @@ func (r *MCPRemoteProxyReconciler) podTemplateMetadataNeedsUpdate(
 
 	configName := ctrlutil.EmbeddedAuthServerConfigName(proxy.Spec.ExternalAuthConfigRef, proxy.Spec.AuthServerRef)
 	if configName != "" {
-		caChecksum, err := ctrlutil.EmbeddedAuthServerCABundleChecksum(ctx, r.Client, proxy.Namespace, configName)
+		caChecksum, err := ctrlutil.EmbeddedAuthServerConfigMapChecksum(ctx, r.Client, proxy.Namespace, configName)
 		if err != nil {
 			log.FromContext(ctx).Error(err, "Failed to calculate auth server CA checksum")
 			return true
 		}
 		if caChecksum != "" {
-			expectedPodTemplateAnnotations[ctrlutil.AuthServerCABundleChecksumAnnotation] = caChecksum
+			expectedPodTemplateAnnotations[ctrlutil.AuthServerConfigMapChecksumAnnotation] = caChecksum
 		}
 	}
 
-	const caChecksumKey = ctrlutil.AuthServerCABundleChecksumAnnotation
+	const caChecksumKey = ctrlutil.AuthServerConfigMapChecksumAnnotation
 	actualCAChecksum, actualCAChecksumSet := deployment.Spec.Template.Annotations[caChecksumKey]
 	expectedCAChecksum, expectedCAChecksumSet := expectedPodTemplateAnnotations[caChecksumKey]
 	if actualCAChecksumSet != expectedCAChecksumSet || actualCAChecksum != expectedCAChecksum {
@@ -2037,8 +2074,9 @@ func (*MCPRemoteProxyReconciler) podTemplateSpecNeedsUpdate(
 // defaults with spec.resourceOverrides.proxyDeployment.imagePullSecrets. Uses
 // equality.Semantic.DeepEqual so nil and empty slices are treated as equal,
 // which matches Kubernetes' own serialization semantics. Also compares the
-// session storage Redis CA volume, whose Secret is not covered by the RunConfig
-// checksum.
+// session storage Redis CA volume and the auth server volumes (TLS listener,
+// signing keys, HMAC secrets, SPIFFE bundles), whose references are not covered
+// by the RunConfig checksum.
 func (r *MCPRemoteProxyReconciler) podSpecNeedsUpdate(
 	ctx context.Context,
 	deployment *appsv1.Deployment,
@@ -2050,31 +2088,7 @@ func (r *MCPRemoteProxyReconciler) podSpecNeedsUpdate(
 		if expectedDeployment == nil {
 			return true
 		}
-		return deployment.Spec.Template.Spec.ServiceAccountName != expectedDeployment.Spec.Template.Spec.ServiceAccountName ||
-			!equality.Semantic.DeepEqual(
-				deployment.Spec.Template.Spec.ImagePullSecrets,
-				expectedDeployment.Spec.Template.Spec.ImagePullSecrets,
-			) ||
-			// Scheduling can come from podTemplateSpec as well as from
-			// resourceOverrides, so compare against the rebuilt Deployment rather
-			// than the overrides alone.
-			!equality.Semantic.DeepEqual(
-				deployment.Spec.Template.Spec.NodeSelector,
-				expectedDeployment.Spec.Template.Spec.NodeSelector,
-			) ||
-			!equality.Semantic.DeepEqual(
-				deployment.Spec.Template.Spec.Tolerations,
-				expectedDeployment.Spec.Template.Spec.Tolerations,
-			) ||
-			!equality.Semantic.DeepEqual(
-				deployment.Spec.Template.Spec.Affinity,
-				expectedDeployment.Spec.Template.Spec.Affinity,
-			) ||
-			// podTemplateSpec may also patch the session storage CA volume.
-			ctrlutil.SessionRedisTLSVolumeNeedsUpdate(
-				deployment.Spec.Template.Spec.Volumes,
-				expectedDeployment.Spec.Template.Spec.Volumes,
-			)
+		return patchedPodSpecNeedsUpdate(deployment.Spec.Template.Spec, expectedDeployment.Spec.Template.Spec)
 	}
 
 	if deployment.Spec.Template.Spec.ServiceAccountName != serviceAccountNameForRemoteProxy(proxy) {
@@ -2085,8 +2099,16 @@ func (r *MCPRemoteProxyReconciler) podSpecNeedsUpdate(
 		return true
 	}
 
-	wantSessionTLSVolumes, _ := ctrlutil.SessionRedisTLSVolumes(proxy.Spec.SessionStorage)
+	storage := proxy.Spec.SessionStorage
+	if storage == nil {
+		storage = r.DefaultRedisConfig.SessionStorage()
+	}
+	wantSessionTLSVolumes, _ := ctrlutil.SessionRedisTLSVolumes(storage)
 	if ctrlutil.SessionRedisTLSVolumeNeedsUpdate(deployment.Spec.Template.Spec.Volumes, wantSessionTLSVolumes) {
+		return true
+	}
+
+	if r.authServerVolumesNeedUpdate(ctx, deployment, proxy) {
 		return true
 	}
 
@@ -2094,10 +2116,53 @@ func (r *MCPRemoteProxyReconciler) podSpecNeedsUpdate(
 	return !equality.Semantic.DeepEqual(deployment.Spec.Template.Spec.ImagePullSecrets, expected)
 }
 
+// patchedPodSpecNeedsUpdate compares the live pod spec with the one rebuilt
+// from a podTemplateSpec patch.
+func patchedPodSpecNeedsUpdate(live, expected corev1.PodSpec) bool {
+	return live.ServiceAccountName != expected.ServiceAccountName ||
+		!equality.Semantic.DeepEqual(live.ImagePullSecrets, expected.ImagePullSecrets) ||
+		// Scheduling can come from podTemplateSpec as well as from
+		// resourceOverrides, so compare against the rebuilt Deployment rather
+		// than the overrides alone.
+		!equality.Semantic.DeepEqual(live.NodeSelector, expected.NodeSelector) ||
+		!equality.Semantic.DeepEqual(live.Tolerations, expected.Tolerations) ||
+		!equality.Semantic.DeepEqual(live.Affinity, expected.Affinity) ||
+		// podTemplateSpec may also patch the session storage CA volume.
+		ctrlutil.SessionRedisTLSVolumeNeedsUpdate(live.Volumes, expected.Volumes) ||
+		ctrlutil.AuthServerVolumesNeedUpdate(live.Volumes, expected.Volumes)
+}
+
+// authServerVolumesNeedUpdate compares the live auth server volumes with the
+// ones generated from the referenced embedded auth server config. A failure to
+// generate them is reported as drift so the next reconcile retries.
+func (r *MCPRemoteProxyReconciler) authServerVolumesNeedUpdate(
+	ctx context.Context,
+	deployment *appsv1.Deployment,
+	proxy *mcpv1beta1.MCPRemoteProxy,
+) bool {
+	var wantAuthServerVolumes []corev1.Volume
+	if configName := ctrlutil.EmbeddedAuthServerConfigName(
+		proxy.Spec.ExternalAuthConfigRef, proxy.Spec.AuthServerRef,
+	); configName != "" {
+		authServerVolumes, _, _, err := ctrlutil.GenerateAuthServerConfigByName(ctx, r.Client, proxy.Namespace, configName)
+		if err != nil {
+			return true
+		}
+		wantAuthServerVolumes = authServerVolumes
+	}
+	return ctrlutil.AuthServerVolumesNeedUpdate(deployment.Spec.Template.Spec.Volumes, wantAuthServerVolumes)
+}
+
 // serviceNeedsUpdate checks if the service needs to be updated
-func (*MCPRemoteProxyReconciler) serviceNeedsUpdate(service *corev1.Service, proxy *mcpv1beta1.MCPRemoteProxy) bool {
-	// Check if port has changed
-	if len(service.Spec.Ports) > 0 && service.Spec.Ports[0].Port != int32(proxy.GetProxyPort()) {
+func (*MCPRemoteProxyReconciler) serviceNeedsUpdate(
+	service *corev1.Service, proxy *mcpv1beta1.MCPRemoteProxy, tlsListener bool,
+) bool {
+	// Check if the operator-owned ports have changed
+	if ctrlutil.ServicePortsDrifted(
+		service.Spec.Ports,
+		ctrlutil.ProxyServicePorts(int32(proxy.GetProxyPort()), tlsListener),
+		ctrlutil.ProxyOwnedPortNames(),
+	) {
 		return true
 	}
 
@@ -2446,7 +2511,7 @@ func (r *MCPRemoteProxyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		).
 		Watches(
 			&corev1.ConfigMap{},
-			handler.EnqueueRequestsFromMapFunc(r.mapAuthServerCABundleConfigMapToMCPRemoteProxy),
+			handler.EnqueueRequestsFromMapFunc(r.mapAuthServerConfigMapToMCPRemoteProxy),
 			builder.WithPredicates(configMapDataChangedPredicate()),
 		).
 		Complete(r)

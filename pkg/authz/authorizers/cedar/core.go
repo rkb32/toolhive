@@ -1026,8 +1026,10 @@ func multiValuedTokens(claimName string, elems []interface{}) []string {
 	return tokens
 }
 
-// preprocessArguments adds an "arg_" prefix to all argument keys.
-// For complex types, it just notes their presence with an "_present" suffix.
+// preprocessArguments adds an "arg_" prefix to all argument keys. Arrays,
+// objects and null only set an "_present" flag and stay absent as "arg_<key>":
+// making them present would let a permit gated on `has` or `!=` match them.
+// See "Using tool arguments in policies" in docs/authz.md.
 func preprocessArguments(arguments map[string]interface{}) map[string]interface{} {
 	if arguments == nil {
 		return nil
@@ -1040,7 +1042,6 @@ func preprocessArguments(arguments map[string]interface{}) map[string]interface{
 		case string, bool, int, int64, float64:
 			preprocessed[argKey] = val
 		default:
-			// For complex types, just note their presence
 			preprocessed[argKey+"_present"] = true
 		}
 	}
@@ -1087,7 +1088,8 @@ func (a *Authorizer) authorizeToolCall(
 	// Annotations are merged first so that the standard attributes ("name",
 	// "operation", "feature") always take precedence and cannot be overwritten
 	// by annotation keys — intentionally or accidentally.
-	annotationAttrs := authorizers.AnnotationsToMap(authorizers.ToolAnnotationsFromContext(ctx))
+	resourceMetadata, _ := authorizers.ResourceMetadataFromContext(ctx)
+	annotationAttrs := authorizers.AnnotationsToMap(resourceMetadata.Annotations)
 
 	// Create attributes for the entities
 	attributes := mergeContexts(annotationAttrs, attrsMap, map[string]interface{}{
@@ -1095,10 +1097,18 @@ func (a *Authorizer) authorizeToolCall(
 		"operation": "call",
 		"feature":   "tool",
 	})
+	resourceParents := func() []cedar.EntityUID {
+		if resourceMetadata.BackendID == "" {
+			return nil
+		}
+		return []cedar.EntityUID{
+			cedar.NewEntityUID(EntityTypeBackend, cedar.String(resourceMetadata.BackendID)),
+		}
+	}()
 
 	// Create Cedar entities
 	entities, err := a.entityFactory.CreateEntitiesForRequest(
-		principal, action, resource, claimsMap, attributes, groups, a.serverName,
+		principal, action, resource, claimsMap, attributes, groups, a.serverName, resourceParents...,
 	)
 	if err != nil {
 		return false, fmt.Errorf("failed to create Cedar entities: %w", err)
@@ -1171,6 +1181,10 @@ func (a *Authorizer) authorizeResourceRead(
 	// so " and \ need escaping in policy source; see docs/authz.md.) A lossy
 	// mapping would let distinct URIs collide onto one entity ID, and a
 	// policy grant on one URI would then silently cover every colliding URI.
+	// Callers refuse a URI that is not in canonical form before this point
+	// (authorizers.CheckResourceURI), which is what lets an exact match protect a
+	// forbid rule against servers that normalize the URI; see "Forbid a specific
+	// resource" in docs/authz.md for the cases it does not cover.
 	resource := fmt.Sprintf("Resource::%s", resourceURI)
 
 	// Create attributes for the entities
@@ -1431,19 +1445,21 @@ func resolveNestedClaim(claims jwt.MapClaims, path string) interface{} {
 
 // extractGroups extracts group/role names from a specific JWT claim.
 // It resolves the claim via resolveNestedClaim (supporting both flat and
-// dot-notation paths) and decodes the value with
-// authclaims.DecodeStringArrayLenient, the shared helper that also backs the
-// strict decoding used by the auth-server upstream filter.
+// dot-notation paths) and decodes the value with authclaims.DecodeStringArrayLenient,
+// Cedar's host-owned lenient decoder. The auth-server GroupBasedFilter uses its
+// separate strict OAuth claims decoder.
 //
 // Return value distinguishes "claim absent" from "claim present but empty"
 // so callers can decide whether to fall back to defaults:
-//   - nil: claimName is empty, the claim is absent, or the value has an
-//     unsupported scalar/object type (e.g. string, number).
-//   - non-nil, possibly empty: the claim is an array. Non-string elements
-//     are silently dropped, so an array of all non-strings yields an empty
-//     slice (not nil). A genuinely empty array (`[]`) also yields an empty
-//     slice. Both cases mean "the IdP said this claim exists with no usable
-//     group names" and suppress fallback.
+//   - nil: claimName is empty, the claim is absent, the value has an
+//     unsupported scalar/object type (e.g. string, number), or the recognized
+//     value is a nil []string. The latter preserves its historical nil-ness,
+//     allowing callers to fall back.
+//   - non-nil, possibly empty: the claim has a recognized array shape other than
+//     a nil []string. Non-string elements are silently dropped, so an []any with
+//     no strings (including []any(nil)) yields a non-nil empty slice. A non-nil
+//     empty []string{} does too. These cases mean "the IdP said this claim exists
+//     with no usable group names" and suppress fallback.
 //
 // The returned slice never aliases the claim value, so the caller may append
 // to it (as authorizeWithClaims does when merging role claims) without writing

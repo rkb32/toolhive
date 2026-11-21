@@ -132,6 +132,11 @@ func TestResolveBedrockModels(t *testing.T) {
 			wantWarnings: []string{`--models entry "some-random-model" did not match a tier (expected haiku/opus/sonnet/fable in the ID); ignored`},
 		},
 		{
+			name:   "a Codex Bedrock GPT pin is skipped without a warning",
+			models: []string{"us.anthropic.claude-opus-x", "us.openai.gpt-6.1-sol"},
+			want:   bedrockTiers{opus: "us.anthropic.claude-opus-x"},
+		},
+		{
 			name:   "matching is case-insensitive",
 			models: []string{"US.ANTHROPIC.CLAUDE-OPUS-X"},
 			want:   bedrockTiers{opus: "US.ANTHROPIC.CLAUDE-OPUS-X"},
@@ -184,11 +189,17 @@ func TestWarnBedrockNoEffect(t *testing.T) {
 			configured:      claudeCode,
 		},
 		{
-			name:            "compat passed this run without claude-code warns",
+			name:            "compat passed this run without claude-code or codex warns",
 			opts:            SetOptions{BedrockCompat: boolPtr(true)},
 			effectiveCompat: true,
 			configured:      cursorOnly,
-			wantWarn:        "--bedrock-compat was set but Claude Code was not configured",
+			wantWarn:        "--bedrock-compat was set but neither Claude Code nor Codex was configured",
+		},
+		{
+			name:            "compat passed this run with only codex configured is silent",
+			opts:            SetOptions{BedrockCompat: boolPtr(true)},
+			effectiveCompat: true,
+			configured:      []ToolConfig{{Tool: codexClient, Mode: llmgateway.ModeCodexAuth}},
 		},
 		{
 			// Regression: bedrock-compat is persisted, so a later run that omits the
@@ -241,16 +252,18 @@ func TestConfigureDetectedTools_BedrockClaudeCode(t *testing.T) {
 	gm := &capturingGatewayManager{mode: "direct"}
 	var out, errOut bytes.Buffer
 
-	_, err := configureDetectedToolsWithDiscovery(
+	configured, err := configureDetectedToolsWithDiscovery(
 		&out, &errOut, gm,
-		[]string{"claude-code"},
+		[]string{"claude-code"}, "",
 		"https://gw.example.com", "http://localhost:14000/v1",
 		"/usr/local/bin/thv", []string{"llm", "token", "--skip-browser"},
 		false, "/anthropic", []string{"us.anthropic.claude-opus-x"}, discoveredGatewayModels{}, false,
-		BedrockConfig{Compat: true, Enable1M: true},
+		BedrockConfig{Compat: true, Enable1M: true}, nil,
 	)
 	require.NoError(t, err)
 	require.Len(t, gm.applied, 1)
+	require.Len(t, configured, 1)
+	assert.Equal(t, new(true), configured[0].BedrockCompat, "the record says this setup wrote Bedrock keys")
 
 	got := gm.applied[0]
 	assert.True(t, got.BedrockCompat)
@@ -269,18 +282,20 @@ func TestConfigureDetectedTools_BedrockSkippedForNonClaudeCode(t *testing.T) {
 	gm := &capturingGatewayManager{mode: "proxy"}
 	var out, errOut bytes.Buffer
 
-	_, err := configureDetectedToolsWithDiscovery(
+	configured, err := configureDetectedToolsWithDiscovery(
 		&out, &errOut, gm,
-		[]string{"cursor"},
+		[]string{"cursor"}, "",
 		"https://gw.example.com", "http://localhost:14000/v1",
 		"/usr/local/bin/thv", []string{"llm", "token", "--skip-browser"},
 		false, "", nil, discoveredGatewayModels{}, false,
-		BedrockConfig{Compat: true},
+		BedrockConfig{Compat: true}, nil,
 	)
 	require.NoError(t, err)
 	require.Len(t, gm.applied, 1)
 	assert.False(t, gm.applied[0].BedrockCompat)
 	assert.Empty(t, gm.applied[0].BedrockOpusModel)
+	require.Len(t, configured, 1)
+	assert.Nil(t, configured[0].BedrockCompat, "only Bedrock clients get a Bedrock record")
 }
 
 func TestConfigureDetectedTools_PromptCache(t *testing.T) {
@@ -345,10 +360,10 @@ func TestConfigureDetectedTools_PromptCache(t *testing.T) {
 			var out, errOut bytes.Buffer
 
 			configured, err := configureDetectedToolsWithDiscovery(
-				&out, &errOut, gm, []string{tt.clientType},
+				&out, &errOut, gm, []string{tt.clientType}, "",
 				"https://gw.example.com", "http://localhost:14000/v1",
 				"/usr/local/bin/thv", []string{"llm", "token", "--skip-browser"},
-				false, "", nil, discoveredGatewayModels{}, tt.shortPromptCache, BedrockConfig{},
+				false, "", nil, discoveredGatewayModels{}, tt.shortPromptCache, BedrockConfig{}, nil,
 			)
 			require.NoError(t, err)
 			require.Len(t, configured, 1)
@@ -442,6 +457,9 @@ func TestIsTarget(t *testing.T) {
 // stubGatewayManager is a minimal GatewayManager for Teardown tests.
 type stubGatewayManager struct {
 	reverted []string
+	// clearedBedrock records, per reverted tool, whether revert was asked to
+	// remove its Bedrock keys.
+	clearedBedrock map[string]bool
 }
 
 func (*stubGatewayManager) DetectedLLMGatewayClients() []string { return nil }
@@ -458,8 +476,12 @@ func (*stubGatewayManager) ConfigureEnvFile(_ string, _ llmgateway.ApplyConfig) 
 	return "", nil
 }
 func (*stubGatewayManager) RevertEnvFile(_, _ string) error { return nil }
-func (s *stubGatewayManager) RevertLLMGateway(clientType, _ string) error {
+func (s *stubGatewayManager) RevertLLMGateway(clientType, _ string, clearBedrockKeys bool) error {
 	s.reverted = append(s.reverted, clientType)
+	if s.clearedBedrock == nil {
+		s.clearedBedrock = make(map[string]bool)
+	}
+	s.clearedBedrock[clientType] = clearBedrockKeys
 	return nil
 }
 
@@ -590,6 +612,134 @@ func TestTeardown_KeepTokensResetsConfigWhenLastToolReverted(t *testing.T) {
 			assert.Equal(t, want, provider.cfg,
 				"no tools remain, so every persisted setting except cached token state must be reset")
 			assert.Contains(t, stdout.String(), "Cleared the LLM gateway configuration")
+		})
+	}
+}
+
+// TestTeardown_RemovesBedrockSettingsOnlyWhenSetupWroteThem checks that
+// teardown removes, and names, the Bedrock keys of Claude Code and Codex only
+// when the tool's setup wrote them: per the tool record, or the persisted
+// setting for a record that predates it. Other clients never warn.
+func TestTeardown_RemovesBedrockSettingsOnlyWhenSetupWroteThem(t *testing.T) {
+	t.Parallel()
+
+	claudeWarning := "Warning: removed the Bedrock settings ToolHive manages for Claude Code " +
+		"(env.CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS and env.ANTHROPIC_DEFAULT_{HAIKU,OPUS,SONNET,FABLE}_MODEL) " +
+		"from /tmp/claude-code.json, whatever they held. If you had set any of them yourself, set them again."
+	codexWarning := "Warning: removed the Bedrock settings ToolHive manages for Codex " +
+		"(model, web_search, model_context_window, memories.consolidation_model and memories.extract_model) " +
+		"from /tmp/codex.json, whatever they held. If you had set any of them yourself, set them again."
+
+	tests := []struct {
+		name         string
+		compat       bool
+		records      map[string]*bool
+		wantCleared  map[string]bool
+		wantWarnings []string
+	}{
+		{
+			name:         "a legacy record falls back to bedrock compat on",
+			compat:       true,
+			wantCleared:  map[string]bool{claudeCodeClient: true, codexClient: true, "cursor": true},
+			wantWarnings: []string{claudeWarning, codexWarning},
+		},
+		{
+			name:        "a legacy record falls back to bedrock compat off",
+			wantCleared: map[string]bool{claudeCodeClient: false, codexClient: false, "cursor": false},
+		},
+		{
+			// "thv llm config set --bedrock-compat=false" after a Bedrock setup.
+			name:         "the tool record wins over the persisted setting",
+			records:      map[string]*bool{claudeCodeClient: new(false), codexClient: new(true)},
+			wantCleared:  map[string]bool{claudeCodeClient: false, codexClient: true, "cursor": false},
+			wantWarnings: []string{codexWarning},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := fullSetupConfig(claudeCodeClient, codexClient, "cursor")
+			cfg.Bedrock.Compat = tt.compat
+			for i, tc := range cfg.ConfiguredTools {
+				cfg.ConfiguredTools[i].BedrockCompat = tt.records[tc.Tool]
+			}
+			provider := &stubConfigUpdater{cfg: cfg}
+			gm := &stubGatewayManager{}
+
+			var stdout, stderr bytes.Buffer
+			err := Teardown(context.Background(), &stdout, &stderr, gm, "", true, false, provider, nil)
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.wantCleared, gm.clearedBedrock)
+			if len(tt.wantWarnings) == 0 {
+				assert.Empty(t, stderr.String())
+				return
+			}
+			got := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+			assert.Equal(t, tt.wantWarnings, got, "one warning per Bedrock client whose keys were removed")
+		})
+	}
+}
+
+// TestPreviousBedrockKeys checks that the previous setup's Bedrock state comes
+// from each tool's record, falling back to the persisted setting for a record
+// that predates it.
+func TestPreviousBedrockKeys(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{
+		Bedrock: BedrockConfig{Compat: true},
+		ConfiguredTools: []ToolConfig{
+			{Tool: claudeCodeClient, BedrockCompat: new(false)},
+			{Tool: codexClient, BedrockCompat: new(true)},
+			{Tool: "cursor"},
+		},
+	}
+	assert.Equal(t, map[string]bool{claudeCodeClient: false, codexClient: true, "cursor": true},
+		previousBedrockKeys(cfg))
+
+	cfg.Bedrock.Compat = false
+	assert.Equal(t, map[string]bool{claudeCodeClient: false, codexClient: true, "cursor": false},
+		previousBedrockKeys(cfg))
+}
+
+// TestWarnBedrockTurnedOff checks that setup warns about the Bedrock settings it
+// removed only on the run that turns Bedrock off for a client, and only for
+// Bedrock clients.
+func TestWarnBedrockTurnedOff(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		previous bool
+		written  bool
+		wantWarn bool
+	}{
+		{name: "turning bedrock off warns", previous: true, wantWarn: true},
+		{name: "staying on bedrock is silent", previous: true, written: true},
+		{name: "turning bedrock on is silent", written: true},
+		{name: "never on bedrock is silent"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			configured := []ToolConfig{
+				{Tool: codexClient, ConfigPath: "/tmp/codex.toml", BedrockCompat: new(tt.written)},
+				{Tool: "cursor", ConfigPath: "/tmp/cursor.json"},
+			}
+			previous := map[string]bool{codexClient: tt.previous, "cursor": tt.previous}
+			var errOut bytes.Buffer
+			warnBedrockTurnedOff(&errOut, previous, configured)
+			if !tt.wantWarn {
+				assert.Empty(t, errOut.String())
+				return
+			}
+			assert.Equal(t, "Warning: removed the Bedrock settings ToolHive manages for Codex "+
+				"(model, web_search, model_context_window, memories.consolidation_model and memories.extract_model) "+
+				"from /tmp/codex.toml, whatever they held. If you had set any of them yourself, set them again.\n",
+				errOut.String(), "one warning for codex, none for cursor")
 		})
 	}
 }
@@ -903,8 +1053,8 @@ func (g *setupGatewayManager) LLMClientDetectionHint(_ string) string {
 func (*setupGatewayManager) ConfigureEnvFile(_ string, _ llmgateway.ApplyConfig) (string, error) {
 	return "", nil
 }
-func (*setupGatewayManager) RevertEnvFile(_, _ string) error    { return nil }
-func (*setupGatewayManager) RevertLLMGateway(_, _ string) error { return nil }
+func (*setupGatewayManager) RevertEnvFile(_, _ string) error            { return nil }
+func (*setupGatewayManager) RevertLLMGateway(_, _ string, _ bool) error { return nil }
 
 // configuredSetupProvider returns a ConfigUpdater whose config satisfies
 // IsConfigured()/Validate() so Setup proceeds past its configuration checks.
@@ -934,7 +1084,7 @@ func TestSetup_Lazy_SkipsLoginAndPersistsTools(t *testing.T) {
 	// anthropicPathPrefixSet=true skips the network probe; lazy=true.
 	err := Setup(
 		context.Background(), &stdout, &stderr, gm, provider, login,
-		SetOptions{}, "", true, "", true,
+		SetOptions{}, "", true, "", true, nil,
 	)
 	require.NoError(t, err)
 
@@ -958,7 +1108,7 @@ func TestSetup_Lazy_VSCodeSelectionSemantics(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		err := Setup(context.Background(), &stdout, &stderr, gm, provider,
 			func(_ context.Context, _ *Config) error { loginCalled = true; return nil },
-			SetOptions{}, "", true, "vscode", true)
+			SetOptions{}, "", true, "vscode", true, nil)
 		require.ErrorContains(t, err, "requires non-lazy setup for authenticated model discovery")
 		assert.False(t, loginCalled)
 		assert.Empty(t, gm.configured)
@@ -972,7 +1122,7 @@ func TestSetup_Lazy_VSCodeSelectionSemantics(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		err := Setup(context.Background(), &stdout, &stderr, gm, provider,
 			func(_ context.Context, _ *Config) error { loginCalled = true; return nil },
-			SetOptions{}, "", true, "", true)
+			SetOptions{}, "", true, "", true, nil)
 		require.NoError(t, err)
 		assert.False(t, loginCalled)
 		assert.Equal(t, []string{"cursor"}, gm.configured)
@@ -1028,7 +1178,7 @@ func TestSetupPiModels(t *testing.T) {
 				func(_ context.Context, cfg *Config) error {
 					cfg.SetDiscoveryAccessToken("discovery-token")
 					return nil
-				}, opts, "/anthropic", true, "pi", tt.lazy)
+				}, opts, "/anthropic", true, "pi", tt.lazy, nil)
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
 				assert.Zero(t, provider.updateCalls)
@@ -1081,7 +1231,7 @@ func TestSetupPiAnthropicPrefix(t *testing.T) {
 			var out, errOut bytes.Buffer
 			err := Setup(context.Background(), &out, &errOut, gm, provider,
 				func(_ context.Context, cfg *Config) error { cfg.SetDiscoveryAccessToken("token"); return nil },
-				SetOptions{}, tt.flag, tt.flagSet, "pi", false)
+				SetOptions{}, tt.flag, tt.flagSet, "pi", false, nil)
 			require.NoError(t, err)
 			require.Len(t, gm.applied, 1)
 			assert.Equal(t, []string{"claude-test"}, gm.applied[0].AnthropicModels)
@@ -1274,7 +1424,7 @@ func TestFilterLazyModelDiscoveryClientsBedrock(t *testing.T) {
 		clients       []string
 		targetClient  string
 		bedrockCompat bool
-		hasModels     bool
+		models        []string
 		wantErr       string
 		wantClients   []string
 		wantWarning   string
@@ -1298,7 +1448,7 @@ func TestFilterLazyModelDiscoveryClientsBedrock(t *testing.T) {
 			clients:       []string{claudeCodeClient},
 			targetClient:  claudeCodeClient,
 			bedrockCompat: true,
-			hasModels:     true,
+			models:        []string{"us.anthropic.claude-opus-4-8"},
 			wantClients:   []string{claudeCodeClient},
 		},
 		{
@@ -1307,6 +1457,29 @@ func TestFilterLazyModelDiscoveryClientsBedrock(t *testing.T) {
 			targetClient: claudeCodeClient,
 			wantClients:  []string{claudeCodeClient},
 		},
+		{
+			name:          "explicit codex with bedrock-compat and no pin is refused",
+			clients:       []string{codexClient},
+			targetClient:  codexClient,
+			bedrockCompat: true,
+			models:        []string{"us.anthropic.claude-opus-4-8"}, // a Claude-only list does not pin Codex
+			wantErr:       "picking a Bedrock model needs authenticated model discovery",
+		},
+		{
+			name:          "auto-detected codex with bedrock-compat and no pin is skipped",
+			clients:       []string{codexClient, "cursor"},
+			bedrockCompat: true,
+			wantClients:   []string{"cursor"},
+			wantWarning:   "skipping codex in lazy mode; --bedrock-compat needs",
+		},
+		{
+			name:          "codex with bedrock-compat and a pin is kept",
+			clients:       []string{codexClient},
+			targetClient:  codexClient,
+			bedrockCompat: true,
+			models:        []string{"us.openai.gpt-6.1-sol"},
+			wantClients:   []string{codexClient},
+		},
 	}
 
 	for _, tt := range tests {
@@ -1314,7 +1487,7 @@ func TestFilterLazyModelDiscoveryClientsBedrock(t *testing.T) {
 			t.Parallel()
 			var warnings strings.Builder
 			got, err := filterLazyModelDiscoveryClients(
-				tt.clients, tt.targetClient, tt.bedrockCompat, tt.hasModels, &warnings)
+				tt.clients, tt.targetClient, tt.bedrockCompat, tt.models, &warnings)
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)
@@ -1509,7 +1682,7 @@ func TestSetup_VSCodeDiscoversModelsAfterLogin(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	err := Setup(context.Background(), &stdout, &stderr, gm, provider,
 		func(_ context.Context, cfg *Config) error { cfg.SetDiscoveryAccessToken("discovery-token"); return nil },
-		SetOptions{}, "", true, "vscode", false)
+		SetOptions{}, "", true, "vscode", false, nil)
 	require.NoError(t, err)
 	require.Len(t, gm.applied, 1)
 	assert.Equal(t, []string{"model-a", "model-b"}, gm.applied[0].DiscoveredModels)
@@ -1537,7 +1710,7 @@ func TestSetup_VSCodeDiscoveryFailureSelectionSemantics(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			err := Setup(context.Background(), &stdout, &stderr, gm, provider,
 				func(_ context.Context, cfg *Config) error { cfg.SetDiscoveryAccessToken("token"); return nil },
-				SetOptions{}, "", true, clientType, false)
+				SetOptions{}, "", true, clientType, false, nil)
 			require.ErrorContains(t, err, "discovering gateway models")
 			require.ErrorContains(t, err, "503 Service Unavailable")
 			assert.Empty(t, gm.configured)
@@ -1552,7 +1725,7 @@ func TestSetup_VSCodeDiscoveryFailureSelectionSemantics(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		err := Setup(context.Background(), &stdout, &stderr, gm, provider,
 			func(_ context.Context, cfg *Config) error { cfg.SetDiscoveryAccessToken("token"); return nil },
-			SetOptions{}, "", true, "", false)
+			SetOptions{}, "", true, "", false, nil)
 		require.NoError(t, err)
 		assert.Equal(t, []string{"cursor"}, gm.configured)
 		assert.Contains(t, stderr.String(), "skipping auto-detected VS Code clients")
@@ -1569,12 +1742,85 @@ func TestSetup_VSCodeDiscoveryFailureSelectionSemantics(t *testing.T) {
 		var stdout, stderr bytes.Buffer
 		err := Setup(context.Background(), &stdout, &stderr, gm, provider,
 			func(_ context.Context, cfg *Config) error { cfg.SetDiscoveryAccessToken("token"); return nil },
-			SetOptions{}, "", true, "", false)
+			SetOptions{}, "", true, "", false, nil)
 		require.NoError(t, err)
 		assert.Empty(t, gm.configured)
 		assert.Zero(t, provider.updateCalls)
 		assert.Contains(t, stderr.String(), "skipping auto-detected VS Code clients")
 	})
+}
+
+// TestSetup_BedrockKeyOwnership checks that a setup without Bedrock asks each
+// client to clear its Bedrock keys only when the persisted record of its
+// previous setup says that setup wrote them, and that it persists a fresh
+// record for each Bedrock client it configures.
+func TestSetup_BedrockKeyOwnership(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		// compat and records are the persisted state before setup.
+		compat  bool
+		records map[string]*bool
+		inline  SetOptions
+		// wantClear is each client's ApplyConfig.ClearBedrockKeys, in detection order.
+		wantClear    []bool
+		wantWarnings []string
+	}{
+		{
+			name:         "turning bedrock off clears what the previous setup wrote",
+			compat:       true,
+			records:      map[string]*bool{claudeCodeClient: nil, codexClient: new(false)},
+			inline:       SetOptions{BedrockCompat: new(false)},
+			wantClear:    []bool{true, false},
+			wantWarnings: []string{"removed the Bedrock settings ToolHive manages for Claude Code"},
+		},
+		{
+			// "thv llm config set --bedrock-compat=false" after a Bedrock setup.
+			name:         "a record written by a bedrock setup clears after config set turned it off",
+			records:      map[string]*bool{claudeCodeClient: new(false), codexClient: new(true)},
+			wantClear:    []bool{false, true},
+			wantWarnings: []string{"removed the Bedrock settings ToolHive manages for Codex"},
+		},
+		{
+			name:      "never on bedrock leaves the keys alone",
+			records:   map[string]*bool{claudeCodeClient: nil, codexClient: nil},
+			wantClear: []bool{false, false},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			gm := &capturingGatewayManager{detected: []string{claudeCodeClient, codexClient}, mode: llmgateway.ModeDirect}
+			provider := configuredSetupProvider()
+			provider.cfg.Bedrock.Compat = tt.compat
+			for _, tool := range []string{claudeCodeClient, codexClient} {
+				provider.cfg.ConfiguredTools = append(provider.cfg.ConfiguredTools,
+					ToolConfig{Tool: tool, ConfigPath: "/tmp/" + tool, BedrockCompat: tt.records[tool]})
+			}
+
+			var stdout, stderr bytes.Buffer
+			err := Setup(
+				context.Background(), &stdout, &stderr, gm, provider,
+				func(context.Context, *Config) error { return nil },
+				tt.inline, "", true, "", true, nil,
+			)
+			require.NoError(t, err)
+
+			require.Len(t, gm.applied, len(tt.wantClear))
+			for i, want := range tt.wantClear {
+				assert.Equal(t, want, gm.applied[i].ClearBedrockKeys, "client %d", i)
+			}
+			for _, w := range tt.wantWarnings {
+				assert.Contains(t, stderr.String(), w)
+			}
+			assert.Equal(t, len(tt.wantWarnings), strings.Count(stderr.String(), "removed the Bedrock settings"))
+			for _, tc := range provider.cfg.ConfiguredTools {
+				assert.Equal(t, new(false), tc.BedrockCompat, "%s: this setup wrote no Bedrock keys", tc.Tool)
+			}
+		})
+	}
 }
 
 func TestSetup_ShortPromptCachePreference(t *testing.T) {
@@ -1601,7 +1847,7 @@ func TestSetup_ShortPromptCachePreference(t *testing.T) {
 			err := Setup(
 				context.Background(), &stdout, &stderr, gm, provider,
 				func(context.Context, *Config) error { return nil },
-				SetOptions{ShortPromptCache: tt.inline}, "", true, "", true,
+				SetOptions{ShortPromptCache: tt.inline}, "", true, "", true, nil,
 			)
 			require.NoError(t, err)
 			require.Len(t, gm.applied, 1)
@@ -1631,7 +1877,7 @@ func TestSetup_ShortPromptCacheWarningForNonClaudeClient(t *testing.T) {
 			err := Setup(
 				context.Background(), &stdout, &stderr, gm, provider,
 				func(context.Context, *Config) error { return nil },
-				SetOptions{ShortPromptCache: tt.inline}, "", true, "cursor", true,
+				SetOptions{ShortPromptCache: tt.inline}, "", true, "cursor", true, nil,
 			)
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantWarn, strings.Contains(stderr.String(), "--short-prompt-cache was set"))
@@ -1667,7 +1913,7 @@ func TestSetup_PromptCacheBedrockWarningOnlyForInlineFlag(t *testing.T) {
 				context.Background(), &stdout, &stderr, gm, provider,
 				func(context.Context, *Config) error { return nil },
 				SetOptions{BedrockCompat: tt.inlineBedrock, Models: []string{"us.anthropic.claude-opus-4-8"}},
-				"", true, "", true,
+				"", true, "", true, nil,
 			)
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantCompatibility,
@@ -1709,7 +1955,7 @@ func TestSetup_NonLazy_InvokesLogin(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	err := Setup(
 		context.Background(), &stdout, &stderr, gm, provider, login,
-		SetOptions{}, "", true, "", false,
+		SetOptions{}, "", true, "", false, nil,
 	)
 	require.NoError(t, err)
 
@@ -1755,7 +2001,7 @@ func TestSetup_NonLazy_LoginFailure(t *testing.T) {
 			var stdout, stderr bytes.Buffer
 			err := Setup(
 				context.Background(), &stdout, &stderr, gm, provider, login,
-				SetOptions{}, "", true, "", false,
+				SetOptions{}, "", true, "", false, nil,
 			)
 
 			require.Error(t, err)
@@ -1790,7 +2036,7 @@ func TestSetup_CallbackPortInUseBeforeLogin(t *testing.T) {
 	err = Setup(
 		context.Background(), &stdout, &stderr,
 		&setupGatewayManager{detected: []string{"cursor"}, mode: "proxy"}, provider, login,
-		SetOptions{}, "", true, "", false,
+		SetOptions{}, "", true, "", false, nil,
 	)
 
 	require.Error(t, err)
@@ -1827,8 +2073,8 @@ func (*capturingGatewayManager) IsManaged(_ string) bool { return false }
 func (*capturingGatewayManager) LLMClientDetectionHint(_ string) string {
 	return ""
 }
-func (*capturingGatewayManager) LLMSetupNoteFor(_ string) string    { return "" }
-func (*capturingGatewayManager) RevertLLMGateway(_, _ string) error { return nil }
+func (*capturingGatewayManager) LLMSetupNoteFor(_ string) string            { return "" }
+func (*capturingGatewayManager) RevertLLMGateway(_, _ string, _ bool) error { return nil }
 func (*capturingGatewayManager) ConfigureEnvFile(_ string, _ llmgateway.ApplyConfig) (string, error) {
 	return "", nil
 }
@@ -1842,11 +2088,11 @@ func TestConfigureDetectedTools_PathPrefixAppendedForDirectMode(t *testing.T) {
 
 	_, err := configureDetectedToolsWithDiscovery(
 		&out, &errOut, gm,
-		[]string{"claude-code"},
+		[]string{"claude-code"}, "",
 		"https://gw.example.com", "http://localhost:14000/v1",
 		"/usr/local/bin/thv", []string{"llm", "token", "--skip-browser"},
 		false, "/anthropic", nil, discoveredGatewayModels{}, false,
-		BedrockConfig{},
+		BedrockConfig{}, nil,
 	)
 	require.NoError(t, err)
 	require.Len(t, gm.applied, 1)
@@ -1864,11 +2110,11 @@ func TestConfigureDetectedTools_NoPrefixWhenEmpty(t *testing.T) {
 
 	_, err := configureDetectedToolsWithDiscovery(
 		&out, &errOut, gm,
-		[]string{"claude-code"},
+		[]string{"claude-code"}, "",
 		"https://gw.example.com", "http://localhost:14000/v1",
 		"/usr/local/bin/thv", []string{"llm", "token", "--skip-browser"},
 		false, "", nil, discoveredGatewayModels{}, false, // no prefix
-		BedrockConfig{},
+		BedrockConfig{}, nil,
 	)
 	require.NoError(t, err)
 	require.Len(t, gm.applied, 1)
@@ -1885,11 +2131,11 @@ func TestConfigureDetectedTools_PrefixNotAppliedForProxyMode(t *testing.T) {
 
 	_, err := configureDetectedToolsWithDiscovery(
 		&out, &errOut, gm,
-		[]string{"cursor"},
+		[]string{"cursor"}, "",
 		"https://gw.example.com", "http://localhost:14000/v1",
 		"/usr/local/bin/thv", []string{"llm", "token", "--skip-browser"},
 		false, "/anthropic", nil, discoveredGatewayModels{}, false,
-		BedrockConfig{},
+		BedrockConfig{}, nil,
 	)
 	require.NoError(t, err)
 	require.Len(t, gm.applied, 1)
@@ -1990,8 +2236,8 @@ func (*managedGatewayManager) LLMClientDetectionHint(_ string) string {
 func (*managedGatewayManager) ConfigureEnvFile(_ string, _ llmgateway.ApplyConfig) (string, error) {
 	return "", nil
 }
-func (*managedGatewayManager) RevertEnvFile(_, _ string) error    { return nil }
-func (*managedGatewayManager) RevertLLMGateway(_, _ string) error { return nil }
+func (*managedGatewayManager) RevertEnvFile(_, _ string) error            { return nil }
+func (*managedGatewayManager) RevertLLMGateway(_, _ string, _ bool) error { return nil }
 
 func TestWarnCredentialHelperTools(t *testing.T) {
 	t.Parallel()
