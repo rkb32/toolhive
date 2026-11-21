@@ -391,26 +391,34 @@ func (rfw *ResponseFilteringWriter) resolveSSEEvent(event []sseLine) []sseLine {
 	if len(event) == 0 {
 		return nil
 	}
-	if eventHasLoneCR(event) {
+	dataValues, assembled, loneCR := assembleSSEEvent(event)
+	if loneCR {
 		body := rfw.errorResponseBody(rfw.requestID(), errors.New("event carries a bare CR line break that the filter cannot split"))
 		return errorEventLines(body)
 	}
-
-	dataValues := eventDataValues(event)
-	if len(dataValues) == 0 {
+	if len(assembled) == 0 {
+		// No data field, or an empty data buffer: a client never dispatches an empty
+		// data buffer, so there is nothing to classify or fail closed on.
 		return event
 	}
+	return rfw.resolveAssembled(event, dataValues, assembled)
+}
 
+// assembleSSEEvent joins the data: values of one SSE event. loneCR reports an
+// event with a bare CR line break, which a client that honours CR would split,
+// so the filter cannot read it as written. assembled is empty when the event has
+// no data: field or an empty payload.
+func assembleSSEEvent(event []sseLine) (dataValues [][]byte, assembled []byte, loneCR bool) {
+	if eventHasLoneCR(event) {
+		return nil, nil, true
+	}
+	dataValues = eventDataValues(event)
+	if len(dataValues) == 0 {
+		return nil, nil, false
+	}
 	// No whole-buffer trim needed here: the per-value trim in eventDataValues
 	// already leaves nothing but JSON-significant bytes at either edge of the join.
-	assembled := bytes.Join(dataValues, []byte("\n"))
-	if len(assembled) == 0 {
-		// A client never dispatches an empty data buffer, so there's nothing
-		// to classify or fail closed on.
-		return event
-	}
-
-	return rfw.resolveAssembled(event, dataValues, assembled)
+	return dataValues, bytes.Join(dataValues, []byte("\n")), false
 }
 
 // resolveAssembled filters an event whose lone-CR check and data join were already
@@ -2020,4 +2028,3 @@ func idValue(rest []byte) (jsonrpc2.ID, bool) {
 	}
 	return jsonrpc2.Int64ID(n), true
 }
-
