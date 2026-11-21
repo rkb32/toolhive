@@ -8,15 +8,11 @@ import (
 	"slices"
 
 	"github.com/ory/fosite"
-
-	"github.com/stacklok/toolhive/pkg/oauthproto"
 )
 
 // SPIFFEClient is the immutable OAuth client representation of a configured
-// SPIFFE principal association. It is neither public nor secret-bearing.
-// JWT-SVID authentication of configured associations is implemented but not
-// yet wired to a trust bundle source (see docs/arch/18-spiffe-association-declarations.md);
-// X.509-SVID credential validation remains pending.
+// SPIFFE principal association. It is neither public nor secret-bearing: it
+// authenticates with an SVID (see docs/arch/18-spiffe-association-declarations.md).
 type SPIFFEClient struct {
 	BackChannelOnlyMarker
 	id         string
@@ -27,12 +23,16 @@ type SPIFFEClient struct {
 }
 
 // NewSPIFFEClient creates an immutable, secretless, non-public client for a
-// configured SPIFFE association. GetAudience returns the configured audience
-// allowlist. resources is the independent RFC 8707 resource allowlist,
-// available via Resources(); it may be empty.
-func NewSPIFFEClient(id string, scopes, audiences, resources []string) (*SPIFFEClient, error) {
+// configured SPIFFE association. grantTypes are the grants the association
+// permits. GetAudience returns the configured audience allowlist. resources is
+// the independent RFC 8707 resource allowlist, available via Resources(); it
+// may be empty.
+func NewSPIFFEClient(id string, grantTypes, scopes, audiences, resources []string) (*SPIFFEClient, error) {
 	if id == "" {
 		return nil, fmt.Errorf("SPIFFE client ID is required")
+	}
+	if len(grantTypes) == 0 {
+		return nil, fmt.Errorf("SPIFFE client grant types are required")
 	}
 	if len(scopes) == 0 || len(audiences) == 0 {
 		return nil, fmt.Errorf("SPIFFE client scopes and audiences are required")
@@ -40,7 +40,7 @@ func NewSPIFFEClient(id string, scopes, audiences, resources []string) (*SPIFFEC
 
 	return &SPIFFEClient{
 		id:         id,
-		grantTypes: fosite.Arguments{oauthproto.GrantTypeTokenExchange},
+		grantTypes: slices.Clone(grantTypes),
 		scopes:     slices.Clone(scopes),
 		audiences:  slices.Clone(audiences),
 		resources:  slices.Clone(resources),
@@ -51,8 +51,7 @@ func NewSPIFFEClient(id string, scopes, audiences, resources []string) (*SPIFFEC
 func (c *SPIFFEClient) GetID() string { return c.id }
 
 // GetHashedSecret returns nil because no OAuth client secret is assigned.
-// JWT-SVID authentication does not use a client secret, and X.509-SVID
-// credential validation remains pending.
+// JWT-SVID and X.509-SVID authentication do not use a client secret.
 func (*SPIFFEClient) GetHashedSecret() []byte { return nil }
 
 // GetRedirectURIs returns nil because SPIFFE clients do not use authorization redirects.
@@ -80,8 +79,7 @@ func (c *SPIFFEClient) Resources() []string { return slices.Clone(c.resources) }
 func (c *SPIFFEClient) GetAudience() fosite.Arguments { return slices.Clone(c.audiences) }
 
 // IsPublic returns false so Fosite does not treat unauthenticated requests as
-// public-client requests. JWT-SVID authentication remains separate from the
-// still-pending X.509-SVID credential validation.
+// public-client requests.
 func (*SPIFFEClient) IsPublic() bool { return false }
 
 var _ fosite.Client = (*SPIFFEClient)(nil)

@@ -15,15 +15,17 @@ import (
 	"strings"
 	"time"
 
-	"github.com/go-jose/go-jose/v3"
+	"github.com/go-jose/go-jose/v4"
 	"github.com/ory/fosite"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/stacklok/toolhive-core/redisconn"
+	"github.com/stacklok/toolhive/pkg/authserver/internal/fositejose"
 	"github.com/stacklok/toolhive/pkg/authserver/server"
 	"github.com/stacklok/toolhive/pkg/authserver/server/registration"
 	"github.com/stacklok/toolhive/pkg/authserver/server/session"
 	"github.com/stacklok/toolhive/pkg/oauthproto"
+	"github.com/stacklok/toolhive/pkg/oauthproto/dcrkey"
 )
 
 // nullMarker is used to store nil upstream tokens in Redis.
@@ -111,7 +113,8 @@ type RedisStorage struct {
 	// so every replica sharing this Redis enforces one cap.
 	maxDCRClients int
 
-	// now is the clock DCR cap index scores are computed from.
+	// now is the clock every DCR cap index score, exchange grant TTL and
+	// exchange grant expiry decision is computed from.
 	now func() time.Time
 }
 
@@ -131,8 +134,9 @@ func WithRedisMaxDCRClients(n int) RedisStorageOption {
 	}
 }
 
-// withRedisClock sets the clock DCR cap index scores are computed from, so
-// tests can keep it in step with miniredis's key TTLs.
+// withRedisClock sets the clock that drives DCR cap index scores and every
+// exchange grant TTL and expiry decision, so tests can keep it in step with
+// miniredis's key TTLs.
 func withRedisClock(now func() time.Time) RedisStorageOption {
 	return func(s *RedisStorage) {
 		s.now = now
@@ -274,10 +278,69 @@ type storedClient struct {
 	// so the row cannot become issuable via fosite's own zero-value
 	// defaulting (see clientFromStored and inertPlaceholderClient).
 	Reserved bool `json:"reserved,omitempty"`
+	// Configured is true when the row was written by ReconcileConfiguredClient,
+	// i.e. it belongs to ToolHive configuration rather than to DCR or an
+	// embedder. Only that method sets it; buildStoredClient, RegisterClient and
+	// UpsertDCRIssuedClient never do. Precedence on read: reserved > configured
+	// > dcr_issued > unmarked. A stamped row is never treated as DCR-issued, so
+	// the legacy "public with a TTL" compensation is skipped for it. The field
+	// is not part of storedClient.fingerprint, so stamping a row written by an
+	// older binary does not read as a policy change. Rows written before this
+	// field existed unmarshal with Configured=false.
+	Configured bool `json:"configured,omitempty"`
 	// JSONWebKeys stores only the inline public keys used by private_key_jwt.
 	// JSONWebKeysURI and other assertion material are intentionally not stored.
-	JSONWebKeys                       *jose.JSONWebKeySet `json:"jwks,omitempty"`
-	TokenEndpointAuthSigningAlgorithm string              `json:"token_endpoint_auth_signing_alg,omitempty"`
+	JSONWebKeys                       *storedJWKS `json:"jwks,omitempty"`
+	TokenEndpointAuthSigningAlgorithm string      `json:"token_endpoint_auth_signing_alg,omitempty"`
+}
+
+// storedJWKS is the persisted form of a client's inline key set. Decoding it
+// never fails the surrounding row: a key set go-jose rejects (for example an
+// RSA modulus above jose.MaxRSAModulusBits, from a registration made before
+// the key limits existed) is kept as raw JSON and marked invalid. GetClient
+// then answers invalid_client for that row, as it does for keys that fail
+// registration.ValidatePrivateKeyJWTClientKeys, instead of a decode error,
+// and other readers of the row (overwrite checks, index backfill) still work.
+type storedJWKS struct {
+	keys    *jose.JSONWebKeySet
+	raw     json.RawMessage
+	invalid bool
+}
+
+func newStoredJWKS(keys *jose.JSONWebKeySet) *storedJWKS {
+	if keys == nil {
+		return nil
+	}
+	return &storedJWKS{keys: keys}
+}
+
+// MarshalJSON writes an invalid key set back exactly as it was read, so
+// rewriting the row does not silently drop it.
+func (s storedJWKS) MarshalJSON() ([]byte, error) {
+	if s.invalid {
+		return s.raw, nil
+	}
+	return json.Marshal(s.keys)
+}
+
+// UnmarshalJSON records a key set that does not decode as invalid rather than
+// returning the error.
+func (s *storedJWKS) UnmarshalJSON(data []byte) error {
+	var keys jose.JSONWebKeySet
+	if err := json.Unmarshal(data, &keys); err != nil {
+		*s = storedJWKS{raw: slices.Clone(data), invalid: true}
+		return nil
+	}
+	*s = storedJWKS{keys: &keys}
+	return nil
+}
+
+// keySet returns the decoded key set, or nil when it is absent or invalid.
+func (s *storedJWKS) keySet() *jose.JSONWebKeySet {
+	if s == nil || s.invalid {
+		return nil
+	}
+	return s.keys
 }
 
 // publicJSONWebKeySet copies an inline JWKS while removing private and
@@ -322,8 +385,9 @@ func publicJSONWebKeySet(jwks *jose.JSONWebKeySet) *jose.JSONWebKeySet {
 //     reports correctly because it reads the Public field directly
 //     (fosite.DefaultClient.IsPublic() returns c.Public, uninfluenced by the
 //     auth method).
-//   - A row with a method was written by registration.New (the only path
-//     that populates the column), so it is rebuilt as a
+//   - A row with a method was written by registration.New or by
+//     registration.NewStaticDelegateClient with a pinned method (the only
+//     paths that populate the column), so it is rebuilt as a
 //     *fosite.DefaultOpenIDConnectClient — fosite enforces the pinned method
 //     at the token endpoint. IsPublic is derived as
 //     (Public && method == "none"): a row that somehow carries both
@@ -346,6 +410,9 @@ func publicJSONWebKeySet(jwks *jose.JSONWebKeySet) *jose.JSONWebKeySet {
 // the stored JSON. A legacy confidential row (no method, Public=false) is
 // never marked regardless of TTL: it predates confidential DCR support
 // entirely and cannot be DCR-issued.
+//
+// A row with Configured set is returned through registration.MarkConfigured
+// before either DCR rule above (dcr_issued, legacy public+TTL) is applied.
 func clientFromStored(stored storedClient, hasTTL bool) fosite.Client {
 	// A reserved SPIFFE placeholder is re-wrapped in the exact inert type it
 	// was built with, ignoring whatever GrantTypes/ResponseTypes/Secret/
@@ -381,6 +448,9 @@ func clientFromStored(stored storedClient, hasTTL bool) fosite.Client {
 			Audience:      stored.Audience,
 			Public:        stored.Public,
 		}
+		if stored.Configured {
+			return markConfiguredFromStored(client)
+		}
 		if stored.DCRIssued || (stored.Public && hasTTL) {
 			return registration.MarkDCRIssuedWithName(client, stored.ClientName)
 		}
@@ -398,13 +468,27 @@ func clientFromStored(stored storedClient, hasTTL bool) fosite.Client {
 			Public:        stored.Public && method == oauthproto.TokenEndpointAuthMethodNone,
 		},
 		TokenEndpointAuthMethod:           method,
-		JSONWebKeys:                       stored.JSONWebKeys,
+		JSONWebKeys:                       fositejose.ToFositeKeySet(stored.JSONWebKeys.keySet()),
 		TokenEndpointAuthSigningAlgorithm: stored.TokenEndpointAuthSigningAlgorithm,
+	}
+	if stored.Configured {
+		return markConfiguredFromStored(oidcClient)
 	}
 	if stored.DCRIssued {
 		return registration.MarkDCRIssuedWithName(oidcClient, stored.ClientName)
 	}
 	return oidcClient
+}
+
+// markConfiguredFromStored stamps a client clientFromStored just rebuilt. Both
+// shapes it builds are accepted by MarkConfigured; if that ever changes, the
+// row reads back as an inert placeholder instead of unstamped.
+func markConfiguredFromStored(client fosite.Client) fosite.Client {
+	marked, ok := registration.MarkConfigured(client)
+	if !ok {
+		return inertPlaceholderClient{DefaultClient: &fosite.DefaultClient{ID: client.GetID()}}
+	}
+	return marked
 }
 
 // buildStoredClient converts client to its serializable form. Record the
@@ -442,7 +526,7 @@ func buildStoredClient(client fosite.Client) storedClient {
 	}
 	if oidcClient, ok := client.(fosite.OpenIDConnectClient); ok {
 		stored.TokenEndpointAuthMethod = oidcClient.GetTokenEndpointAuthMethod()
-		stored.JSONWebKeys = publicJSONWebKeySet(oidcClient.GetJSONWebKeys())
+		stored.JSONWebKeys = newStoredJWKS(publicJSONWebKeySet(fositejose.FromFositeKeySet(oidcClient.GetJSONWebKeys())))
 		stored.TokenEndpointAuthSigningAlgorithm = oidcClient.GetTokenEndpointAuthSigningAlgorithm()
 	}
 	stored.DCRIssued = registration.DCRIssued(client)
@@ -459,6 +543,9 @@ func buildStoredClient(client fosite.Client) storedClient {
 // operator-declared clients reconcile through ReconcileConfiguredClient
 // instead.
 func (s *RedisStorage) RegisterClient(ctx context.Context, client fosite.Client) error {
+	if registration.IsConfigured(client) {
+		return fmt.Errorf("client %q must not carry the configured stamp; use ReconcileConfiguredClient", client.GetID())
+	}
 	if err := ValidateRegisterableClientID(client.GetID()); err != nil {
 		return err
 	}
@@ -684,13 +771,16 @@ func (s *RedisStorage) UpsertDCRIssuedClient(ctx context.Context, client fosite.
 // directly sidesteps that defaulting entirely.
 func (s storedClient) fingerprint() clientFingerprint {
 	return clientFingerprint{
-		scopes:              s.Scopes,
-		audience:            s.Audience,
-		grantTypes:          s.GrantTypes,
-		responseTypes:       s.ResponseTypes,
-		resources:           s.Resources,
-		identityFingerprint: s.IdentityFingerprint,
-		public:              s.Public,
+		scopes:                  s.Scopes,
+		audience:                s.Audience,
+		grantTypes:              s.GrantTypes,
+		responseTypes:           s.ResponseTypes,
+		redirectURIs:            s.RedirectURIs,
+		tokenEndpointAuthMethod: s.TokenEndpointAuthMethod,
+		resources:               s.Resources,
+		identityFingerprint:     s.IdentityFingerprint,
+		public:                  s.Public,
+		reserved:                s.Reserved,
 	}
 }
 
@@ -706,15 +796,15 @@ func (s storedClient) fingerprint() clientFingerprint {
 const maxConfiguredClientReconcileRetries = 5
 
 // ReconcileConfiguredClient applies an operator-declared client: creates it
-// if absent, idempotently replaces a matching-fingerprint configured client
-// (the restart-with-unchanged-config case), or refuses with ErrAlreadyExists
-// when the existing record is DCR-issued or a different configured client.
-// See the ClientRegistry interface doc for the full contract.
+// if absent, otherwise replaces the existing record unless
+// configuredClientConflict refuses (or the record is DCR-issued), in which
+// case it returns ErrAlreadyExists. See the ClientRegistry interface doc for
+// the full contract.
 //
 // The read-check-write sequence for an existing key runs inside a Redis
 // WATCH/MULTI transaction so a concurrent writer (e.g. a DCR registration on
 // another replica racing this reconciliation) cannot interleave between the
-// fingerprint check and the write. Redis aborts the transaction if the
+// conflict check and the write. Redis aborts the transaction if the
 // watched key changed concurrently, and go-redis surfaces that as
 // redis.TxFailedErr rather than retrying it — see
 // maxConfiguredClientReconcileRetries for why this method retries that error
@@ -725,12 +815,16 @@ func (s *RedisStorage) ReconcileConfiguredClient(ctx context.Context, client fos
 	if registration.DCRIssued(client) {
 		return fmt.Errorf("configured client %q must not carry the DCR-issued marker", client.GetID())
 	}
+	if err := checkConfiguredClientType(client); err != nil {
+		return err
+	}
 	if err := ValidateRegisterableClientID(client.GetID()); err != nil {
 		return err
 	}
 
 	key := redisKey(s.keyPrefix, KeyTypeClient, client.GetID())
 	stored := buildStoredClient(client)
+	stored.Configured = true
 	data, err := json.Marshal(stored) //nolint:gosec // G117 - internal Redis storage serialization, not exposed to users
 	if err != nil {
 		return fmt.Errorf("failed to marshal client: %w", err)
@@ -749,6 +843,9 @@ func (s *RedisStorage) ReconcileConfiguredClient(ctx context.Context, client fos
 		return err
 	}
 
+	// replaced holds the fingerprint of the row the successful attempt
+	// overwrote, nil when the key was absent.
+	var replaced *clientFingerprint
 	txFn := func(tx *redis.Tx) error {
 		existingData, getErr := tx.Get(ctx, key).Bytes()
 		if errors.Is(getErr, redis.Nil) {
@@ -777,20 +874,27 @@ func (s *RedisStorage) ReconcileConfiguredClient(ctx context.Context, client fos
 			return fmt.Errorf("%w: client %q is DCR-issued, refusing to overwrite with a configured client",
 				ErrAlreadyExists, client.GetID())
 		}
-		if !existingStored.fingerprint().equal(stored.fingerprint()) {
-			return fmt.Errorf("%w: client %q is already registered as a different configured client",
-				ErrAlreadyExists, client.GetID())
+		existingFP := existingStored.fingerprint()
+		if conflictErr := configuredClientConflict(client.GetID(), existingFP, stored.fingerprint()); conflictErr != nil {
+			return conflictErr
 		}
 
+		replaced = &existingFP
 		return setPipelined(tx)
 	}
 
 	var watchErr error
 	for attempt := 0; attempt < maxConfiguredClientReconcileRetries; attempt++ {
+		replaced = nil
 		watchErr = s.client.Watch(ctx, txFn, key)
 		if !errors.Is(watchErr, redis.TxFailedErr) {
-			return watchErr
+			break
 		}
+	}
+	// replaced is only meaningful when watchErr is nil: the last attempt may
+	// have set it before EXEC aborted.
+	if watchErr == nil && replaced != nil {
+		warnConfiguredClientReplaced(client.GetID(), *replaced, stored.fingerprint())
 	}
 	return watchErr
 }
@@ -834,6 +938,11 @@ func (s *RedisStorage) GetClient(ctx context.Context, id string) (fosite.Client,
 		return nil, fmt.Errorf("failed to unmarshal client: %w", err)
 	}
 
+	if stored.JSONWebKeys != nil && stored.JSONWebKeys.invalid {
+		slog.DebugContext(ctx, "rejecting client whose signing keys no longer meet server policy",
+			"client_id", id, "reason", "stored JSON Web Key Set does not decode")
+		return nil, fosite.ErrInvalidClient.WithHint("client signing keys no longer meet server policy")
+	}
 	client := clientFromStored(stored, hasTTL)
 	if dcrErr := registration.ValidatePrivateKeyJWTClientKeys(client); dcrErr != nil {
 		slog.DebugContext(ctx, "rejecting client whose signing keys no longer meet server policy",
@@ -908,37 +1017,39 @@ func (s *RedisStorage) ClientAssertionJWTValid(ctx context.Context, jti string) 
 		if errors.Is(err, redis.Nil) {
 			return fosite.ErrJTIKnown
 		}
-		return fmt.Errorf("failed to reserve JWT: %w", err)
+		err = fmt.Errorf("failed to reserve JWT: %w", err)
+		server.RecordClientAssertionStoreFailure(ctx, err)
+		return err
 	}
 	return nil
 }
 
-// SetClientAssertionJWT extends jti's replay marker to its real expiry,
-// rejecting an exp further than MaxAssertionLifespan in the future. This
-// bounds how long a replay-tracking entry survives regardless of what the
-// client's own assertion claims — otherwise a registered caller could set
-// exp decades out and give Redis a key with a correspondingly enormous TTL.
-// Unconditional overwrite, not a fresh atomic check: only the caller that
-// already won ClientAssertionJWTValid's reservation reaches this call. If
-// the JWT has already expired (exp is in the past), this deletes the
-// reservation instead: there is no need to keep it for replay detection
-// since the assertion will be rejected on expiry checks before reaching the
-// JTI lookup.
-func (s *RedisStorage) SetClientAssertionJWT(ctx context.Context, jti string, exp time.Time) error {
-	if time.Until(exp) > server.MaxAssertionLifespan {
-		return fmt.Errorf("assertion lifetime exceeds maximum of %s", server.MaxAssertionLifespan)
+// SetClientAssertionJWT extends jti's replay marker to deadline, which becomes
+// the key's TTL as given. The authorization server hands it the marker deadline
+// (server.ClientAssertionRetainUntil of the assertion's exp), so the marker
+// outlives the clock skew in which the assertion is still accepted. A deadline
+// that server.ValidateClientAssertionMarkerDeadline refuses, because it is not
+// in the future or too far ahead, is rejected with invalid_client and the key is
+// left as ClientAssertionJWTValid reserved it. The ahead bound keeps a
+// registered caller from setting a deadline decades out and giving Redis a key
+// with a correspondingly enormous TTL. Unconditional overwrite, not a fresh
+// atomic check: only the caller that already won ClientAssertionJWTValid's
+// reservation reaches this call. The check must precede Set: go-redis sends no
+// expiry for a non-positive duration other than -1ns, which it sends as KEEPTTL.
+func (s *RedisStorage) SetClientAssertionJWT(ctx context.Context, jti string, deadline time.Time) error {
+	now := time.Now()
+	if err := server.ValidateClientAssertionMarkerDeadline(deadline, now); err != nil {
+		return err
 	}
 
 	key := redisKey(s.keyPrefix, KeyTypeJWT, jti)
 
-	ttl := time.Until(exp)
-	if ttl <= 0 {
-		slog.Debug("removing reservation for already-expired client assertion JWT",
-			"jti", jti, "exp", exp)
-		return s.client.Del(ctx, key).Err()
+	if err := s.client.Set(ctx, key, "1", deadline.Sub(now)).Err(); err != nil {
+		err = fmt.Errorf("failed to record client assertion JWT: %w", err)
+		server.RecordClientAssertionStoreFailure(ctx, err)
+		return err
 	}
-
-	return s.client.Set(ctx, key, "1", ttl).Err()
+	return nil
 }
 
 // ConsumeAssertionJWT atomically records an assertion JWT as consumed until its
@@ -2114,7 +2225,7 @@ func (s *storedDCRCredentials) toDCRCredentials() *DCRCredentials {
 		clientSecretExpiresAt = time.Unix(s.ClientSecretExpiresAt, 0)
 	}
 	return &DCRCredentials{
-		Key: DCRKey{
+		Key: dcrkey.Key{
 			Issuer:      s.KeyIssuer,
 			UpstreamID:  s.KeyUpstreamID,
 			RedirectURI: s.KeyRedirectURI,
@@ -2479,7 +2590,7 @@ func (s *RedisStorage) UpdateDCRCredentialsIfUnchanged(
 // any stored row because StoreDCRCredentialsIfAbsent rejects such keys, so a Get
 // against one is a normal miss — ErrNotFound — matching
 // MemoryStorage.GetDCRCredentials and the DCRCredentialStore interface contract.
-func (s *RedisStorage) GetDCRCredentials(ctx context.Context, key DCRKey) (*DCRCredentials, error) {
+func (s *RedisStorage) GetDCRCredentials(ctx context.Context, key dcrkey.Key) (*DCRCredentials, error) {
 	redisKey := redisDCRKey(s.keyPrefix, key)
 	data, err := s.client.Get(ctx, redisKey).Bytes()
 	if err != nil {
@@ -2503,32 +2614,33 @@ func (s *RedisStorage) GetDCRCredentials(ctx context.Context, key DCRKey) (*DCRC
 
 // storedPendingAuthorization is a serializable wrapper for PendingAuthorization.
 type storedPendingAuthorization struct {
-	ClientID                string   `json:"client_id"`
-	RedirectURI             string   `json:"redirect_uri"`
-	State                   string   `json:"state"`
-	PKCEChallenge           string   `json:"pkce_challenge"`
-	PKCEMethod              string   `json:"pkce_method"`
-	Scopes                  []string `json:"scopes"`
-	Resource                string   `json:"resource,omitempty"`
-	ConsentStage            string   `json:"consent_stage,omitempty"`
-	RememberConsent         bool     `json:"remember_consent,omitempty"`
-	FirstProviderSubject    string   `json:"first_provider_subject,omitempty"`
-	ExpectedUserID          string   `json:"expected_user_id,omitempty"`
-	ExpectedProviderSubject string   `json:"expected_provider_subject,omitempty"`
-	ConsentSessionDigest    string   `json:"consent_session_digest,omitempty"`
-	InternalState           string   `json:"internal_state"`
-	UpstreamPKCEVerifier    string   `json:"upstream_pkce_verifier"`
-	UpstreamNonce           string   `json:"upstream_nonce"`
-	BrowserBindingHash      string   `json:"browser_binding_hash,omitempty"`
-	UpstreamProviderName    string   `json:"upstream_provider_name,omitempty"`
-	SessionID               string   `json:"session_id,omitempty"`
-	ResolvedUserID          string   `json:"resolved_user_id,omitempty"`
-	ResolvedUserName        string   `json:"resolved_user_name,omitempty"`
-	ResolvedUserEmail       string   `json:"resolved_user_email,omitempty"`
-	SingleLeg               bool     `json:"single_leg,omitempty"`
-	ChainUpstreams          []string `json:"chain_upstreams,omitempty"`
-	CreatedAt               int64    `json:"created_at"`
-	CreatedAtNano           int64    `json:"created_at_nano,omitempty"`
+	ClientID                string                  `json:"client_id"`
+	RedirectURI             string                  `json:"redirect_uri"`
+	State                   string                  `json:"state"`
+	PKCEChallenge           string                  `json:"pkce_challenge"`
+	PKCEMethod              string                  `json:"pkce_method"`
+	Scopes                  []string                `json:"scopes"`
+	Resource                string                  `json:"resource,omitempty"`
+	ConsentStage            string                  `json:"consent_stage,omitempty"`
+	RememberConsent         bool                    `json:"remember_consent,omitempty"`
+	FirstProviderSubject    string                  `json:"first_provider_subject,omitempty"`
+	ExpectedUserID          string                  `json:"expected_user_id,omitempty"`
+	ExpectedProviderSubject string                  `json:"expected_provider_subject,omitempty"`
+	ConsentSessionDigest    string                  `json:"consent_session_digest,omitempty"`
+	InternalState           string                  `json:"internal_state"`
+	UpstreamPKCEVerifier    string                  `json:"upstream_pkce_verifier"`
+	UpstreamNonce           string                  `json:"upstream_nonce"`
+	BrowserBindingHash      string                  `json:"browser_binding_hash,omitempty"`
+	UpstreamProviderName    string                  `json:"upstream_provider_name,omitempty"`
+	SessionID               string                  `json:"session_id,omitempty"`
+	ResolvedUserID          string                  `json:"resolved_user_id,omitempty"`
+	ResolvedUserName        string                  `json:"resolved_user_name,omitempty"`
+	ResolvedUserEmail       string                  `json:"resolved_user_email,omitempty"`
+	VerifiedUpstream        session.UpstreamSubject `json:"verified_upstream,omitzero"`
+	SingleLeg               bool                    `json:"single_leg,omitempty"`
+	ChainUpstreams          []string                `json:"chain_upstreams,omitempty"`
+	CreatedAt               int64                   `json:"created_at"`
+	CreatedAtNano           int64                   `json:"created_at_nano,omitempty"`
 }
 
 // StorePendingAuthorization stores a pending authorization request.
@@ -2565,6 +2677,7 @@ func (s *RedisStorage) StorePendingAuthorization(ctx context.Context, state stri
 		ResolvedUserID:          pending.ResolvedUserID,
 		ResolvedUserName:        pending.ResolvedUserName,
 		ResolvedUserEmail:       pending.ResolvedUserEmail,
+		VerifiedUpstream:        pending.VerifiedUpstream,
 		SingleLeg:               pending.SingleLeg,
 		ChainUpstreams:          slices.Clone(pending.ChainUpstreams),
 		CreatedAt:               pending.CreatedAt.Unix(),
@@ -2633,6 +2746,7 @@ func (s *RedisStorage) LoadPendingAuthorization(ctx context.Context, state strin
 		ResolvedUserID:          stored.ResolvedUserID,
 		ResolvedUserName:        stored.ResolvedUserName,
 		ResolvedUserEmail:       stored.ResolvedUserEmail,
+		VerifiedUpstream:        stored.VerifiedUpstream,
 		SingleLeg:               stored.SingleLeg,
 		ChainUpstreams:          slices.Clone(stored.ChainUpstreams),
 		CreatedAt:               createdAt,
@@ -2752,14 +2866,15 @@ func (s *RedisStorage) DeletePendingDeviceLogin(ctx context.Context, state strin
 // storedPendingDeviceConfirmation is a serializable wrapper for
 // PendingDeviceConfirmation.
 type storedPendingDeviceConfirmation struct {
-	DeviceCode        string                `json:"device_code"`
-	UserCode          string                `json:"user_code"`
-	ResolvedUserID    string                `json:"resolved_user_id,omitempty"`
-	ResolvedUserName  string                `json:"resolved_user_name,omitempty"`
-	ResolvedUserEmail string                `json:"resolved_user_email,omitempty"`
-	UpstreamTokens    *storedUpstreamTokens `json:"upstream_tokens,omitempty"`
-	Synthetic         bool                  `json:"synthetic,omitempty"`
-	CreatedAt         int64                 `json:"created_at"`
+	DeviceCode        string                  `json:"device_code"`
+	UserCode          string                  `json:"user_code"`
+	ResolvedUserID    string                  `json:"resolved_user_id,omitempty"`
+	ResolvedUserName  string                  `json:"resolved_user_name,omitempty"`
+	ResolvedUserEmail string                  `json:"resolved_user_email,omitempty"`
+	VerifiedUpstream  session.UpstreamSubject `json:"verified_upstream,omitzero"`
+	UpstreamTokens    *storedUpstreamTokens   `json:"upstream_tokens,omitempty"`
+	Synthetic         bool                    `json:"synthetic,omitempty"`
+	CreatedAt         int64                   `json:"created_at"`
 }
 
 // StorePendingDeviceConfirmation stores a pending device-flow confirmation,
@@ -2784,6 +2899,7 @@ func (s *RedisStorage) StorePendingDeviceConfirmation(
 		ResolvedUserID:    pending.ResolvedUserID,
 		ResolvedUserName:  pending.ResolvedUserName,
 		ResolvedUserEmail: pending.ResolvedUserEmail,
+		VerifiedUpstream:  pending.VerifiedUpstream,
 		UpstreamTokens:    newStoredUpstreamTokens(pending.UpstreamTokens),
 		Synthetic:         pending.Synthetic,
 		CreatedAt:         pending.CreatedAt.Unix(),
@@ -2832,6 +2948,7 @@ func (s *RedisStorage) LoadPendingDeviceConfirmation(
 		ResolvedUserID:    stored.ResolvedUserID,
 		ResolvedUserName:  stored.ResolvedUserName,
 		ResolvedUserEmail: stored.ResolvedUserEmail,
+		VerifiedUpstream:  stored.VerifiedUpstream,
 		UpstreamTokens:    upstreamTokens,
 		Synthetic:         stored.Synthetic,
 		CreatedAt:         createdAt,
@@ -2863,19 +2980,20 @@ func (s *RedisStorage) DeletePendingDeviceConfirmation(ctx context.Context, toke
 // required interval must not appear to have waited long enough merely due to
 // storage rounding -- see deviceTimeToUnixNano / deviceUnixNanoToTime.
 type storedDeviceRequest struct {
-	DeviceCode        string              `json:"device_code"`
-	UserCode          string              `json:"user_code"`
-	ClientID          string              `json:"client_id"`
-	Scopes            []string            `json:"scopes"`
-	Audience          []string            `json:"audience,omitempty"`
-	Status            DeviceRequestStatus `json:"status"`
-	IntervalSeconds   int64               `json:"interval_seconds,omitempty"`
-	LastPolledAtNano  int64               `json:"last_polled_at_nano,omitempty"`
-	ResolvedUserID    string              `json:"resolved_user_id,omitempty"`
-	ResolvedUserName  string              `json:"resolved_user_name,omitempty"`
-	ResolvedUserEmail string              `json:"resolved_user_email,omitempty"`
-	SessionID         string              `json:"session_id,omitempty"`
-	CreatedAt         int64               `json:"created_at"`
+	DeviceCode        string                  `json:"device_code"`
+	UserCode          string                  `json:"user_code"`
+	ClientID          string                  `json:"client_id"`
+	Scopes            []string                `json:"scopes"`
+	Audience          []string                `json:"audience,omitempty"`
+	Status            DeviceRequestStatus     `json:"status"`
+	IntervalSeconds   int64                   `json:"interval_seconds,omitempty"`
+	LastPolledAtNano  int64                   `json:"last_polled_at_nano,omitempty"`
+	ResolvedUserID    string                  `json:"resolved_user_id,omitempty"`
+	ResolvedUserName  string                  `json:"resolved_user_name,omitempty"`
+	ResolvedUserEmail string                  `json:"resolved_user_email,omitempty"`
+	VerifiedUpstream  session.UpstreamSubject `json:"verified_upstream,omitzero"`
+	SessionID         string                  `json:"session_id,omitempty"`
+	CreatedAt         int64                   `json:"created_at"`
 }
 
 // deviceTimeToUnixNano converts t to epoch nanoseconds for JSON storage, using 0 to
@@ -2912,6 +3030,7 @@ func (stored *storedDeviceRequest) toDeviceRequest() *DeviceRequest {
 		ResolvedUserID:    stored.ResolvedUserID,
 		ResolvedUserName:  stored.ResolvedUserName,
 		ResolvedUserEmail: stored.ResolvedUserEmail,
+		VerifiedUpstream:  stored.VerifiedUpstream,
 		SessionID:         stored.SessionID,
 		CreatedAt:         time.Unix(stored.CreatedAt, 0),
 	}
@@ -2955,6 +3074,7 @@ func (s *RedisStorage) StoreDeviceRequest(ctx context.Context, device *DeviceReq
 		ResolvedUserID:    device.ResolvedUserID,
 		ResolvedUserName:  device.ResolvedUserName,
 		ResolvedUserEmail: device.ResolvedUserEmail,
+		VerifiedUpstream:  device.VerifiedUpstream,
 		SessionID:         device.SessionID,
 		CreatedAt:         device.CreatedAt.Unix(),
 	}
@@ -3105,17 +3225,18 @@ func (s *RedisStorage) updateDeviceRequest(
 // MarkDeviceRequestAuthorized transitions a pending device request to
 // authorized, attaching the resolved identity.
 func (s *RedisStorage) MarkDeviceRequestAuthorized(
-	ctx context.Context, deviceCode string, resolvedUserID, resolvedUserName, resolvedUserEmail, sessionID string,
+	ctx context.Context, deviceCode string, auth DeviceAuthorization,
 ) error {
 	return s.updateDeviceRequest(ctx, deviceCode, func(stored *storedDeviceRequest) error {
 		if stored.Status != DeviceRequestStatusPending {
 			return fmt.Errorf("%w: device request is %q, not pending", ErrInvalidState, stored.Status)
 		}
 		stored.Status = DeviceRequestStatusAuthorized
-		stored.ResolvedUserID = resolvedUserID
-		stored.ResolvedUserName = resolvedUserName
-		stored.ResolvedUserEmail = resolvedUserEmail
-		stored.SessionID = sessionID
+		stored.ResolvedUserID = auth.UserID
+		stored.ResolvedUserName = auth.UserName
+		stored.ResolvedUserEmail = auth.UserEmail
+		stored.VerifiedUpstream = auth.VerifiedUpstream
+		stored.SessionID = auth.SessionID
 		return nil
 	})
 }
@@ -3532,6 +3653,13 @@ func marshalRequester(request fosite.Requester) ([]byte, error) {
 // unmarshalRequester deserializes a fosite.Requester from JSON.
 // It requires storage access to look up the client and a session factory
 // to create the correct session type for deserialization.
+//
+// The client lookup goes to this backend directly, below ClientAdmissionStorage,
+// so it is identity-only: it names the client a stored session belongs to and
+// does not prove that client is still admitted. That is safe because fosite
+// always compares the session's client ID with the client the request
+// authenticated through the admitted store, and a removed client cannot
+// authenticate. Do not use a rehydrated client as an authentication result.
 func unmarshalRequester(ctx context.Context, data []byte, s *RedisStorage) (fosite.Requester, error) {
 	var stored storedSession
 	if err := json.Unmarshal(data, &stored); err != nil {

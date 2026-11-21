@@ -354,8 +354,10 @@ spec:
                                 acceptedAudiences:
                                   description: |-
                                     AcceptedAudiences identifies this authorization server's accepted
-                                    assertion audiences. When omitted, runtime validation defaults to the
-                                    token endpoint.
+                                    assertion audiences. When omitted, plain JWT-bearer assertions must name
+                                    the token endpoint, and ID-JAG assertions may name the token endpoint or
+                                    this server's issuer identifier, unless the issuer is also an allowed
+                                    resource audience. A configured list replaces these defaults.
                                   items:
                                     maxLength: 2048
                                     minLength: 1
@@ -436,9 +438,10 @@ spec:
                           description: |-
                             SPIFFEClientConfig associates one SPIFFE principal pattern from a declared
                             trust domain with an explicit OAuth client identity and permissions.
-                            Configuration is not authentication: configured SPIFFE clients remain
-                            non-public OAuth clients without a secret until live SPIFFE credential
-                            validation is implemented (see SPIFFETrustDomainConfig's doc comment).
+                            Declaring a client does not grant access by itself. SPIFFE clients
+                            authenticate with a JWT-SVID or an X.509-SVID and have no client secret.
+                            Trust material comes from the declared bundle source (see
+                            SPIFFETrustDomainConfig's doc comment).
 
                             GrantTypes is deliberately not exposed here: the runtime only accepts
                             exactly the RFC 8693 token-exchange grant for a SPIFFE client
@@ -809,24 +812,20 @@ spec:
                   spiffeTrustDomains:
                     description: |-
                       SPIFFETrustDomains declares SPIFFE trust domains for
-                      inboundGrants.spiffeClientAuth associations. See SPIFFETrustDomainConfig's
-                      doc comment for why declaring a domain does not by itself enable
-                      authentication in this build.
+                      inboundGrants.spiffeClientAuth associations. Each declaration must be
+                      referenced by an inboundGrants.spiffeClientAuth entry.
                     items:
                       description: |-
                         SPIFFETrustDomainConfig declares one SPIFFE trust domain accepted by the
-                        embedded authorization server. Configuration is not authentication: no
-                        live X.509-SVID or JWT-SVID validation exists yet, so a declared trust
-                        domain does not by itself let any workload authenticate — RunConfig.Validate
-                        (pkg/authserver/config.go) currently hard-rejects any non-empty
-                        spiffeTrustDomains at authserver startup via validateSPIFFENotYetEnforced,
-                        a deliberate placeholder until real SVID verification lands.
+                        embedded authorization server. A declared domain becomes usable only after
+                        the configured source supplies trust material during auth-server startup.
                       properties:
                         bundleSource:
                           description: |-
                             BundleSource declares exactly one trust-bundle source and is validated for
-                            shape here. The standalone file loader exists, but is not wired into SPIFFE
-                            authentication.
+                            shape here. Only the file source is loaded in this build; bundle_endpoint
+                            and workload_api are rejected when the auth-server configuration is
+                            validated.
                           properties:
                             endpoint:
                               description: |-
@@ -1181,6 +1180,50 @@ spec:
                         - redis
                         type: string
                     type: object
+                  tlsListener:
+                    description: |-
+                      TLSListener configures an additional TLS listener on port 8443 that
+                      serves the embedded authorization server's routes. MCP traffic, health
+                      probes and metrics stay on plain HTTP. Both certificateSecretRef and
+                      privateKeySecretRef are required. It is required when
+                      inboundGrants.spiffeClientAuth enables spiffe_x509. That requirement is
+                      checked when the resource is reconciled and reported in status conditions;
+                      the API server does not reject it. The operator exposes the listener as an
+                      https-auth container port and Service port 8443. Updates to the referenced
+                      Secret contents are picked up without a pod restart.
+                    properties:
+                      certificateSecretRef:
+                        description: CertificateSecretRef references the PEM-encoded
+                          TLS certificate.
+                        properties:
+                          key:
+                            description: Key is the key within the secret
+                            type: string
+                          name:
+                            description: Name is the name of the secret
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                      privateKeySecretRef:
+                        description: PrivateKeySecretRef references the PEM-encoded
+                          TLS private key.
+                        properties:
+                          key:
+                            description: Key is the key within the secret
+                            type: string
+                          name:
+                            description: Name is the name of the secret
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                    required:
+                    - certificateSecretRef
+                    - privateKeySecretRef
+                    type: object
                   tokenLifespans:
                     description: |-
                       TokenLifespans configures the duration that various tokens are valid.
@@ -1383,8 +1426,10 @@ spec:
                             acceptedAudiences:
                               description: |-
                                 AcceptedAudiences identifies this authorization server's accepted
-                                assertion audiences. When omitted, runtime validation defaults to the
-                                token endpoint.
+                                assertion audiences. When omitted, plain JWT-bearer assertions must name
+                                the token endpoint, and ID-JAG assertions may name the token endpoint or
+                                this server's issuer identifier, unless the issuer is also an allowed
+                                resource audience. A configured list replaces these defaults.
                               items:
                                 maxLength: 2048
                                 minLength: 1
@@ -1494,8 +1539,10 @@ spec:
                     description: |-
                       UpstreamProviders configures connections to upstream Identity Providers.
                       When configured, the embedded auth server delegates interactive authentication
-                      to these providers. It may be omitted only when delegateClients or a trusted
-                      issuer with jwtBearerGrant enables token-only operation.
+                      to these providers. It may be omitted only when token-only operation is
+                      enabled by delegateClients (also under inboundGrants.tokenExchange),
+                      inboundGrants.spiffeClientAuth, or a trusted issuer with jwtBearerGrant
+                      (also under inboundGrants.jwtBearer).
                       MCPServer and MCPRemoteProxy support a single upstream; VirtualMCPServer supports multiple.
                     items:
                       description: |-
@@ -1681,6 +1728,51 @@ spec:
                                   maxLength: 2048
                                   pattern: ^https://[^\s?#]+[^/\s?#]$
                                   type: string
+                                registrationProbe:
+                                  description: |-
+                                    RegistrationProbe selects how ToolHive checks the cached upstream client
+                                    at start. tokenEndpoint (the default) redeems a random authorization
+                                    code with the cached client and reads invalid_client as "registration
+                                    gone"; it decides only for upstreams that authenticate the client
+                                    before validating the grant. authorizationEndpoint sends an
+                                    authorization request for the cached client without following
+                                    redirects and reads a direct 400, 401 or 403 that carries an RFC 6749
+                                    JSON error object (error invalid_client, unauthorized_client or
+                                    invalid_request) as "gone" (RFC 6749 §4.1.2.1), for upstreams whose
+                                    token endpoint answers invalid_grant for any client_id; an HTML page or
+                                    a bare gateway status is not a verdict. A false rejection re-registers
+                                    at every start and, when registration also fails, fails startup. none
+                                    skips the check: the upstream is not contacted, but a registration made
+                                    with another method than a configured tokenEndpointAuthMethod is still
+                                    replaced. Otherwise the registration is retired only through
+                                    RotationKey.
+                                  enum:
+                                  - tokenEndpoint
+                                  - authorizationEndpoint
+                                  - none
+                                  type: string
+                                registrationProbeInterval:
+                                  description: |-
+                                    RegistrationProbeInterval, when set, repeats the start-time check while
+                                    the proxy runs, as a duration of at least 1m; 5m to 15m suits most
+                                    upstreams. ToolHive re-reads the cached registration, checks it with
+                                    RegistrationProbe, replaces a rejected one or registers a missing one,
+                                    and switches to the result in place when it differs from the client in
+                                    use, including when another replica replaced it. Without it, a
+                                    registration the upstream drops stays in use until the proxy restarts.
+                                    Each check sends at most one RegistrationProbe request to the upstream
+                                    from every replica (none with RegistrationProbe none), plus a
+                                    registration request when the probe rejects the client; the
+                                    tokenEndpoint probe appears in upstream logs as a failed code
+                                    redemption. A re-registration presents the initial access token the pod
+                                    read at start, so an upstream that issues single-use initial access
+                                    tokens still needs a restart to recover.
+                                  pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                                  type: string
+                                  x-kubernetes-validations:
+                                  - message: registrationProbeInterval must be at
+                                      least 1m
+                                    rule: duration(self) >= duration('1m')
                                 rotationKey:
                                   description: |-
                                     RotationKey is an optional operator-chosen label that is part of the
@@ -1688,14 +1780,13 @@ spec:
                                     Change it to make the proxies register a fresh client at their next
                                     start instead of reusing the cached one: for example after the
                                     upstream has dropped the registration, or when a rotation is required.
-                                    At start ToolHive checks the cached client at the upstream's token
-                                    endpoint and registers a new one by itself when the upstream answers
-                                    invalid_client. Where that check cannot tell (an upstream that answers
-                                    a dropped public client like a live one, or a private_key_jwt client),
-                                    the stale client_id is only rejected in the user's browser, and
-                                    changing this key is the remedy. The previous registration's row stays
-                                    in storage, and upstream refresh tokens bound to the previous client_id
-                                    stop refreshing, so affected users sign in again.
+                                    At start ToolHive checks the cached client at the upstream (see
+                                    RegistrationProbe) and registers a new one by itself when the upstream
+                                    rejects it. Where the configured probe cannot tell, the stale client_id
+                                    may only be rejected in the user's browser, and changing this key is
+                                    the remedy. The previous registration's row stays in storage, and
+                                    upstream refresh tokens bound to the previous client_id stop
+                                    refreshing, so affected users sign in again.
                                   maxLength: 64
                                   pattern: ^[A-Za-z0-9._-]+$
                                   type: string
@@ -1815,6 +1906,11 @@ spec:
                                 client_secret_post-shaped default). Set this to client_secret_basic explicitly
                                 for providers that require HTTP Basic auth. Public clients without a secret use
                                 the "none" method.
+                                With DCRConfig, it is the method the client registers with, in place of the one
+                                ToolHive picks from the upstream's advertised methods (client_secret_basic, then
+                                client_secret_post, then none). Set it for an upstream whose token endpoint does
+                                not accept the method ToolHive picks. A cached registration made with another
+                                method is replaced with a new one at the next start.
                               enum:
                               - none
                               - client_secret_basic
@@ -2089,6 +2185,51 @@ spec:
                                   maxLength: 2048
                                   pattern: ^https://[^\s?#]+[^/\s?#]$
                                   type: string
+                                registrationProbe:
+                                  description: |-
+                                    RegistrationProbe selects how ToolHive checks the cached upstream client
+                                    at start. tokenEndpoint (the default) redeems a random authorization
+                                    code with the cached client and reads invalid_client as "registration
+                                    gone"; it decides only for upstreams that authenticate the client
+                                    before validating the grant. authorizationEndpoint sends an
+                                    authorization request for the cached client without following
+                                    redirects and reads a direct 400, 401 or 403 that carries an RFC 6749
+                                    JSON error object (error invalid_client, unauthorized_client or
+                                    invalid_request) as "gone" (RFC 6749 §4.1.2.1), for upstreams whose
+                                    token endpoint answers invalid_grant for any client_id; an HTML page or
+                                    a bare gateway status is not a verdict. A false rejection re-registers
+                                    at every start and, when registration also fails, fails startup. none
+                                    skips the check: the upstream is not contacted, but a registration made
+                                    with another method than a configured tokenEndpointAuthMethod is still
+                                    replaced. Otherwise the registration is retired only through
+                                    RotationKey.
+                                  enum:
+                                  - tokenEndpoint
+                                  - authorizationEndpoint
+                                  - none
+                                  type: string
+                                registrationProbeInterval:
+                                  description: |-
+                                    RegistrationProbeInterval, when set, repeats the start-time check while
+                                    the proxy runs, as a duration of at least 1m; 5m to 15m suits most
+                                    upstreams. ToolHive re-reads the cached registration, checks it with
+                                    RegistrationProbe, replaces a rejected one or registers a missing one,
+                                    and switches to the result in place when it differs from the client in
+                                    use, including when another replica replaced it. Without it, a
+                                    registration the upstream drops stays in use until the proxy restarts.
+                                    Each check sends at most one RegistrationProbe request to the upstream
+                                    from every replica (none with RegistrationProbe none), plus a
+                                    registration request when the probe rejects the client; the
+                                    tokenEndpoint probe appears in upstream logs as a failed code
+                                    redemption. A re-registration presents the initial access token the pod
+                                    read at start, so an upstream that issues single-use initial access
+                                    tokens still needs a restart to recover.
+                                  pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                                  type: string
+                                  x-kubernetes-validations:
+                                  - message: registrationProbeInterval must be at
+                                      least 1m
+                                    rule: duration(self) >= duration('1m')
                                 rotationKey:
                                   description: |-
                                     RotationKey is an optional operator-chosen label that is part of the
@@ -2096,14 +2237,13 @@ spec:
                                     Change it to make the proxies register a fresh client at their next
                                     start instead of reusing the cached one: for example after the
                                     upstream has dropped the registration, or when a rotation is required.
-                                    At start ToolHive checks the cached client at the upstream's token
-                                    endpoint and registers a new one by itself when the upstream answers
-                                    invalid_client. Where that check cannot tell (an upstream that answers
-                                    a dropped public client like a live one, or a private_key_jwt client),
-                                    the stale client_id is only rejected in the user's browser, and
-                                    changing this key is the remedy. The previous registration's row stays
-                                    in storage, and upstream refresh tokens bound to the previous client_id
-                                    stop refreshing, so affected users sign in again.
+                                    At start ToolHive checks the cached client at the upstream (see
+                                    RegistrationProbe) and registers a new one by itself when the upstream
+                                    rejects it. Where the configured probe cannot tell, the stale client_id
+                                    may only be rejected in the user's browser, and changing this key is
+                                    the remedy. The previous registration's row stays in storage, and
+                                    upstream refresh tokens bound to the previous client_id stop
+                                    refreshing, so affected users sign in again.
                                   maxLength: 64
                                   pattern: ^[A-Za-z0-9._-]+$
                                   type: string
@@ -4243,10 +4383,14 @@ spec:
                   passthroughHeaders:
                     description: |-
                       PassthroughHeaders is an allowlist of incoming client request header names
-                      forwarded verbatim to all backends. Captured at the vMCP incoming edge by
-                      headerforward.CaptureMiddleware and consumed once at session creation
-                      when the per-session backend client's HeaderForwardConfig is built. Names
-                      must not be in the restricted set (Host, hop-by-hop, X-Forwarded-*, etc.).
+                      forwarded verbatim to all backends. Captured per request at the vMCP
+                      incoming edge by headerforward.CaptureMiddleware: tool calls, resource
+                      reads and prompt gets carry the values from the request that triggered
+                      them, and a header absent on that request is not forwarded. Session-scoped
+                      work (the session's backend connections, its advertised capability list,
+                      and background capability resyncs) uses the values from the request that
+                      created the session. Names must not be in the restricted set (Host,
+                      hop-by-hop, X-Forwarded-*, etc.).
                     items:
                       type: string
                     type: array
@@ -5742,8 +5886,10 @@ spec:
                                 acceptedAudiences:
                                   description: |-
                                     AcceptedAudiences identifies this authorization server's accepted
-                                    assertion audiences. When omitted, runtime validation defaults to the
-                                    token endpoint.
+                                    assertion audiences. When omitted, plain JWT-bearer assertions must name
+                                    the token endpoint, and ID-JAG assertions may name the token endpoint or
+                                    this server's issuer identifier, unless the issuer is also an allowed
+                                    resource audience. A configured list replaces these defaults.
                                   items:
                                     maxLength: 2048
                                     minLength: 1
@@ -5824,9 +5970,10 @@ spec:
                           description: |-
                             SPIFFEClientConfig associates one SPIFFE principal pattern from a declared
                             trust domain with an explicit OAuth client identity and permissions.
-                            Configuration is not authentication: configured SPIFFE clients remain
-                            non-public OAuth clients without a secret until live SPIFFE credential
-                            validation is implemented (see SPIFFETrustDomainConfig's doc comment).
+                            Declaring a client does not grant access by itself. SPIFFE clients
+                            authenticate with a JWT-SVID or an X.509-SVID and have no client secret.
+                            Trust material comes from the declared bundle source (see
+                            SPIFFETrustDomainConfig's doc comment).
 
                             GrantTypes is deliberately not exposed here: the runtime only accepts
                             exactly the RFC 8693 token-exchange grant for a SPIFFE client
@@ -6197,24 +6344,20 @@ spec:
                   spiffeTrustDomains:
                     description: |-
                       SPIFFETrustDomains declares SPIFFE trust domains for
-                      inboundGrants.spiffeClientAuth associations. See SPIFFETrustDomainConfig's
-                      doc comment for why declaring a domain does not by itself enable
-                      authentication in this build.
+                      inboundGrants.spiffeClientAuth associations. Each declaration must be
+                      referenced by an inboundGrants.spiffeClientAuth entry.
                     items:
                       description: |-
                         SPIFFETrustDomainConfig declares one SPIFFE trust domain accepted by the
-                        embedded authorization server. Configuration is not authentication: no
-                        live X.509-SVID or JWT-SVID validation exists yet, so a declared trust
-                        domain does not by itself let any workload authenticate — RunConfig.Validate
-                        (pkg/authserver/config.go) currently hard-rejects any non-empty
-                        spiffeTrustDomains at authserver startup via validateSPIFFENotYetEnforced,
-                        a deliberate placeholder until real SVID verification lands.
+                        embedded authorization server. A declared domain becomes usable only after
+                        the configured source supplies trust material during auth-server startup.
                       properties:
                         bundleSource:
                           description: |-
                             BundleSource declares exactly one trust-bundle source and is validated for
-                            shape here. The standalone file loader exists, but is not wired into SPIFFE
-                            authentication.
+                            shape here. Only the file source is loaded in this build; bundle_endpoint
+                            and workload_api are rejected when the auth-server configuration is
+                            validated.
                           properties:
                             endpoint:
                               description: |-
@@ -6569,6 +6712,50 @@ spec:
                         - redis
                         type: string
                     type: object
+                  tlsListener:
+                    description: |-
+                      TLSListener configures an additional TLS listener on port 8443 that
+                      serves the embedded authorization server's routes. MCP traffic, health
+                      probes and metrics stay on plain HTTP. Both certificateSecretRef and
+                      privateKeySecretRef are required. It is required when
+                      inboundGrants.spiffeClientAuth enables spiffe_x509. That requirement is
+                      checked when the resource is reconciled and reported in status conditions;
+                      the API server does not reject it. The operator exposes the listener as an
+                      https-auth container port and Service port 8443. Updates to the referenced
+                      Secret contents are picked up without a pod restart.
+                    properties:
+                      certificateSecretRef:
+                        description: CertificateSecretRef references the PEM-encoded
+                          TLS certificate.
+                        properties:
+                          key:
+                            description: Key is the key within the secret
+                            type: string
+                          name:
+                            description: Name is the name of the secret
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                      privateKeySecretRef:
+                        description: PrivateKeySecretRef references the PEM-encoded
+                          TLS private key.
+                        properties:
+                          key:
+                            description: Key is the key within the secret
+                            type: string
+                          name:
+                            description: Name is the name of the secret
+                            type: string
+                        required:
+                        - key
+                        - name
+                        type: object
+                    required:
+                    - certificateSecretRef
+                    - privateKeySecretRef
+                    type: object
                   tokenLifespans:
                     description: |-
                       TokenLifespans configures the duration that various tokens are valid.
@@ -6771,8 +6958,10 @@ spec:
                             acceptedAudiences:
                               description: |-
                                 AcceptedAudiences identifies this authorization server's accepted
-                                assertion audiences. When omitted, runtime validation defaults to the
-                                token endpoint.
+                                assertion audiences. When omitted, plain JWT-bearer assertions must name
+                                the token endpoint, and ID-JAG assertions may name the token endpoint or
+                                this server's issuer identifier, unless the issuer is also an allowed
+                                resource audience. A configured list replaces these defaults.
                               items:
                                 maxLength: 2048
                                 minLength: 1
@@ -6882,8 +7071,10 @@ spec:
                     description: |-
                       UpstreamProviders configures connections to upstream Identity Providers.
                       When configured, the embedded auth server delegates interactive authentication
-                      to these providers. It may be omitted only when delegateClients or a trusted
-                      issuer with jwtBearerGrant enables token-only operation.
+                      to these providers. It may be omitted only when token-only operation is
+                      enabled by delegateClients (also under inboundGrants.tokenExchange),
+                      inboundGrants.spiffeClientAuth, or a trusted issuer with jwtBearerGrant
+                      (also under inboundGrants.jwtBearer).
                       MCPServer and MCPRemoteProxy support a single upstream; VirtualMCPServer supports multiple.
                     items:
                       description: |-
@@ -7069,6 +7260,51 @@ spec:
                                   maxLength: 2048
                                   pattern: ^https://[^\s?#]+[^/\s?#]$
                                   type: string
+                                registrationProbe:
+                                  description: |-
+                                    RegistrationProbe selects how ToolHive checks the cached upstream client
+                                    at start. tokenEndpoint (the default) redeems a random authorization
+                                    code with the cached client and reads invalid_client as "registration
+                                    gone"; it decides only for upstreams that authenticate the client
+                                    before validating the grant. authorizationEndpoint sends an
+                                    authorization request for the cached client without following
+                                    redirects and reads a direct 400, 401 or 403 that carries an RFC 6749
+                                    JSON error object (error invalid_client, unauthorized_client or
+                                    invalid_request) as "gone" (RFC 6749 §4.1.2.1), for upstreams whose
+                                    token endpoint answers invalid_grant for any client_id; an HTML page or
+                                    a bare gateway status is not a verdict. A false rejection re-registers
+                                    at every start and, when registration also fails, fails startup. none
+                                    skips the check: the upstream is not contacted, but a registration made
+                                    with another method than a configured tokenEndpointAuthMethod is still
+                                    replaced. Otherwise the registration is retired only through
+                                    RotationKey.
+                                  enum:
+                                  - tokenEndpoint
+                                  - authorizationEndpoint
+                                  - none
+                                  type: string
+                                registrationProbeInterval:
+                                  description: |-
+                                    RegistrationProbeInterval, when set, repeats the start-time check while
+                                    the proxy runs, as a duration of at least 1m; 5m to 15m suits most
+                                    upstreams. ToolHive re-reads the cached registration, checks it with
+                                    RegistrationProbe, replaces a rejected one or registers a missing one,
+                                    and switches to the result in place when it differs from the client in
+                                    use, including when another replica replaced it. Without it, a
+                                    registration the upstream drops stays in use until the proxy restarts.
+                                    Each check sends at most one RegistrationProbe request to the upstream
+                                    from every replica (none with RegistrationProbe none), plus a
+                                    registration request when the probe rejects the client; the
+                                    tokenEndpoint probe appears in upstream logs as a failed code
+                                    redemption. A re-registration presents the initial access token the pod
+                                    read at start, so an upstream that issues single-use initial access
+                                    tokens still needs a restart to recover.
+                                  pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                                  type: string
+                                  x-kubernetes-validations:
+                                  - message: registrationProbeInterval must be at
+                                      least 1m
+                                    rule: duration(self) >= duration('1m')
                                 rotationKey:
                                   description: |-
                                     RotationKey is an optional operator-chosen label that is part of the
@@ -7076,14 +7312,13 @@ spec:
                                     Change it to make the proxies register a fresh client at their next
                                     start instead of reusing the cached one: for example after the
                                     upstream has dropped the registration, or when a rotation is required.
-                                    At start ToolHive checks the cached client at the upstream's token
-                                    endpoint and registers a new one by itself when the upstream answers
-                                    invalid_client. Where that check cannot tell (an upstream that answers
-                                    a dropped public client like a live one, or a private_key_jwt client),
-                                    the stale client_id is only rejected in the user's browser, and
-                                    changing this key is the remedy. The previous registration's row stays
-                                    in storage, and upstream refresh tokens bound to the previous client_id
-                                    stop refreshing, so affected users sign in again.
+                                    At start ToolHive checks the cached client at the upstream (see
+                                    RegistrationProbe) and registers a new one by itself when the upstream
+                                    rejects it. Where the configured probe cannot tell, the stale client_id
+                                    may only be rejected in the user's browser, and changing this key is
+                                    the remedy. The previous registration's row stays in storage, and
+                                    upstream refresh tokens bound to the previous client_id stop
+                                    refreshing, so affected users sign in again.
                                   maxLength: 64
                                   pattern: ^[A-Za-z0-9._-]+$
                                   type: string
@@ -7203,6 +7438,11 @@ spec:
                                 client_secret_post-shaped default). Set this to client_secret_basic explicitly
                                 for providers that require HTTP Basic auth. Public clients without a secret use
                                 the "none" method.
+                                With DCRConfig, it is the method the client registers with, in place of the one
+                                ToolHive picks from the upstream's advertised methods (client_secret_basic, then
+                                client_secret_post, then none). Set it for an upstream whose token endpoint does
+                                not accept the method ToolHive picks. A cached registration made with another
+                                method is replaced with a new one at the next start.
                               enum:
                               - none
                               - client_secret_basic
@@ -7477,6 +7717,51 @@ spec:
                                   maxLength: 2048
                                   pattern: ^https://[^\s?#]+[^/\s?#]$
                                   type: string
+                                registrationProbe:
+                                  description: |-
+                                    RegistrationProbe selects how ToolHive checks the cached upstream client
+                                    at start. tokenEndpoint (the default) redeems a random authorization
+                                    code with the cached client and reads invalid_client as "registration
+                                    gone"; it decides only for upstreams that authenticate the client
+                                    before validating the grant. authorizationEndpoint sends an
+                                    authorization request for the cached client without following
+                                    redirects and reads a direct 400, 401 or 403 that carries an RFC 6749
+                                    JSON error object (error invalid_client, unauthorized_client or
+                                    invalid_request) as "gone" (RFC 6749 §4.1.2.1), for upstreams whose
+                                    token endpoint answers invalid_grant for any client_id; an HTML page or
+                                    a bare gateway status is not a verdict. A false rejection re-registers
+                                    at every start and, when registration also fails, fails startup. none
+                                    skips the check: the upstream is not contacted, but a registration made
+                                    with another method than a configured tokenEndpointAuthMethod is still
+                                    replaced. Otherwise the registration is retired only through
+                                    RotationKey.
+                                  enum:
+                                  - tokenEndpoint
+                                  - authorizationEndpoint
+                                  - none
+                                  type: string
+                                registrationProbeInterval:
+                                  description: |-
+                                    RegistrationProbeInterval, when set, repeats the start-time check while
+                                    the proxy runs, as a duration of at least 1m; 5m to 15m suits most
+                                    upstreams. ToolHive re-reads the cached registration, checks it with
+                                    RegistrationProbe, replaces a rejected one or registers a missing one,
+                                    and switches to the result in place when it differs from the client in
+                                    use, including when another replica replaced it. Without it, a
+                                    registration the upstream drops stays in use until the proxy restarts.
+                                    Each check sends at most one RegistrationProbe request to the upstream
+                                    from every replica (none with RegistrationProbe none), plus a
+                                    registration request when the probe rejects the client; the
+                                    tokenEndpoint probe appears in upstream logs as a failed code
+                                    redemption. A re-registration presents the initial access token the pod
+                                    read at start, so an upstream that issues single-use initial access
+                                    tokens still needs a restart to recover.
+                                  pattern: ^([0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$
+                                  type: string
+                                  x-kubernetes-validations:
+                                  - message: registrationProbeInterval must be at
+                                      least 1m
+                                    rule: duration(self) >= duration('1m')
                                 rotationKey:
                                   description: |-
                                     RotationKey is an optional operator-chosen label that is part of the
@@ -7484,14 +7769,13 @@ spec:
                                     Change it to make the proxies register a fresh client at their next
                                     start instead of reusing the cached one: for example after the
                                     upstream has dropped the registration, or when a rotation is required.
-                                    At start ToolHive checks the cached client at the upstream's token
-                                    endpoint and registers a new one by itself when the upstream answers
-                                    invalid_client. Where that check cannot tell (an upstream that answers
-                                    a dropped public client like a live one, or a private_key_jwt client),
-                                    the stale client_id is only rejected in the user's browser, and
-                                    changing this key is the remedy. The previous registration's row stays
-                                    in storage, and upstream refresh tokens bound to the previous client_id
-                                    stop refreshing, so affected users sign in again.
+                                    At start ToolHive checks the cached client at the upstream (see
+                                    RegistrationProbe) and registers a new one by itself when the upstream
+                                    rejects it. Where the configured probe cannot tell, the stale client_id
+                                    may only be rejected in the user's browser, and changing this key is
+                                    the remedy. The previous registration's row stays in storage, and
+                                    upstream refresh tokens bound to the previous client_id stop
+                                    refreshing, so affected users sign in again.
                                   maxLength: 64
                                   pattern: ^[A-Za-z0-9._-]+$
                                   type: string
@@ -9631,10 +9915,14 @@ spec:
                   passthroughHeaders:
                     description: |-
                       PassthroughHeaders is an allowlist of incoming client request header names
-                      forwarded verbatim to all backends. Captured at the vMCP incoming edge by
-                      headerforward.CaptureMiddleware and consumed once at session creation
-                      when the per-session backend client's HeaderForwardConfig is built. Names
-                      must not be in the restricted set (Host, hop-by-hop, X-Forwarded-*, etc.).
+                      forwarded verbatim to all backends. Captured per request at the vMCP
+                      incoming edge by headerforward.CaptureMiddleware: tool calls, resource
+                      reads and prompt gets carry the values from the request that triggered
+                      them, and a header absent on that request is not forwarded. Session-scoped
+                      work (the session's backend connections, its advertised capability list,
+                      and background capability resyncs) uses the values from the request that
+                      created the session. Names must not be in the restricted set (Host,
+                      hop-by-hop, X-Forwarded-*, etc.).
                     items:
                       type: string
                     type: array

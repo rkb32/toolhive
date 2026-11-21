@@ -73,8 +73,8 @@ type SPIFFETrustDomainRunConfig struct {
 	Methods []SPIFFEAuthenticationMethod `json:"methods" yaml:"methods"`
 
 	// BundleSource declares exactly one trust-bundle source and is validated for
-	// shape here. The standalone file loader exists, but source initialization
-	// is not wired into SPIFFE authentication.
+	// shape here. Only the file source is loaded in this build; bundle_endpoint
+	// and workload_api are rejected by Validate.
 	BundleSource SPIFFEBundleSourceRunConfig `json:"bundle_source" yaml:"bundle_source"`
 }
 
@@ -270,9 +270,35 @@ func ValidateSPIFFETrust(
 	return err
 }
 
+// ValidateSPIFFEX509Issuer parses issuer and requires the https scheme that
+// SPIFFE X.509 client authentication needs, since only the TLS listener can
+// request a client certificate. It returns the parsed issuer.
+func ValidateSPIFFEX509Issuer(issuer string) (*url.URL, error) {
+	parsed, err := url.Parse(issuer)
+	if err != nil {
+		return nil, fmt.Errorf("parse auth server issuer: %w", err)
+	}
+	if parsed.Scheme != "https" {
+		return nil, fmt.Errorf("SPIFFE X.509 authentication requires an https issuer")
+	}
+	return parsed, nil
+}
+
+// ValidateSPIFFEClientIDsNotDelegates rejects a client_id that is configured
+// both as a SPIFFE client association and as a delegate client. Both register a
+// static client under that ID, so the second registration would fail at startup.
+func ValidateSPIFFEClientIDsNotDelegates(spiffeClientIDs, delegateClientIDs []string) error {
+	for _, id := range spiffeClientIDs {
+		if slices.Contains(delegateClientIDs, id) {
+			return fmt.Errorf("client_id %q is configured both as a SPIFFE client association and as a delegate client", id)
+		}
+	}
+	return nil
+}
+
 // SPIFFETrustDomain is the immutable normalized form of a declared SPIFFE
 // trust domain: its canonical trust domain string, enabled credential
-// methods, and bundle-source declaration. Future X.509/JWT-SVID validators
+// methods, and bundle-source declaration. The X.509 and JWT-SVID validators
 // look this up by declaration name instead of re-parsing the raw RunConfig,
 // so the canonical trust domain and enabled methods have exactly one
 // authoritative source.
@@ -702,11 +728,18 @@ func parseTrustDomain(trustDomain string) (spiffeid.TrustDomain, error) {
 }
 
 func normalizeSPIFFEPrincipal(principal string, allowPattern bool) (string, error) {
+	if !allowPattern {
+		id, err := parseConcreteSPIFFEID(principal)
+		if err != nil {
+			return "", err
+		}
+		return id.String(), nil
+	}
 	if principal == "" {
 		return "", fmt.Errorf("is required")
 	}
 	wildcard := strings.HasSuffix(principal, "/*")
-	if strings.Contains(principal, "*") && (!allowPattern || !wildcard || strings.Count(principal, "*") != 1) {
+	if strings.Contains(principal, "*") && (!wildcard || strings.Count(principal, "*") != 1) {
 		return "", fmt.Errorf("must use only a terminal /* wildcard")
 	}
 	base := strings.TrimSuffix(principal, "/*")
@@ -721,6 +754,24 @@ func normalizeSPIFFEPrincipal(principal string, allowPattern bool) (string, erro
 		return id.String() + "/*", nil
 	}
 	return id.String(), nil
+}
+
+// parseConcreteSPIFFEID parses a non-pattern SPIFFE ID that must include a path.
+func parseConcreteSPIFFEID(principal string) (spiffeid.ID, error) {
+	if principal == "" {
+		return spiffeid.ID{}, fmt.Errorf("is required")
+	}
+	if strings.Contains(principal, "*") {
+		return spiffeid.ID{}, fmt.Errorf("must use only a terminal /* wildcard")
+	}
+	id, err := parseSPIFFEID(principal)
+	if err != nil {
+		return spiffeid.ID{}, err
+	}
+	if id.Path() == "" {
+		return spiffeid.ID{}, fmt.Errorf("must include a path or terminal /* wildcard")
+	}
+	return id, nil
 }
 
 func parseSPIFFEID(principal string) (spiffeid.ID, error) {

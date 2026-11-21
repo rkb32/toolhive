@@ -57,6 +57,9 @@ type MCPServerReconciler struct {
 	Scheme           *runtime.Scheme
 	Recorder         events.EventRecorder
 	PlatformDetector *ctrlutil.SharedPlatformDetector
+	// DefaultRedisConfig is the read-only global Redis snapshot loaded at startup.
+	// Nil means no global fallback is configured.
+	DefaultRedisConfig *ctrlutil.DefaultRedisConfig
 	// ImagePullSecretsDefaults are cluster-wide defaults sourced from the
 	// operator chart that are merged with the per-CR imagePullSecrets when
 	// constructing workloads. The zero value is a usable empty Defaults.
@@ -575,11 +578,18 @@ func (r *MCPServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 	// Check if the Service already exists, if not create a new one
 	serviceName := ctrlutil.CreateProxyServiceName(mcpServer.Name)
+	tlsListener, err := ctrlutil.ResolveTLSListenerEnabled(
+		ctx, r.Client, mcpServer.Namespace, mcpServer.Spec.ExternalAuthConfigRef, mcpServer.Spec.AuthServerRef,
+	)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	service := &corev1.Service{}
 	err = r.Get(ctx, types.NamespacedName{Name: serviceName, Namespace: mcpServer.Namespace}, service)
 	if err != nil && errors.IsNotFound(err) {
 		// Define a new service
-		svc := r.serviceForMCPServer(ctx, mcpServer)
+		svc := r.serviceForMCPServer(ctx, mcpServer, tlsListener)
 		if svc == nil {
 			ctxLogger.Error(nil, "Failed to create Service object")
 			return ctrl.Result{}, fmt.Errorf("failed to create Service object")
@@ -655,9 +665,9 @@ func (r *MCPServerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	}
 
 	// Check if the service spec changed
-	if serviceNeedsUpdate(service, mcpServer) {
+	if serviceNeedsUpdate(service, mcpServer, tlsListener) {
 		// Update the service
-		newService := r.serviceForMCPServer(ctx, mcpServer)
+		newService := r.serviceForMCPServer(ctx, mcpServer, tlsListener)
 		service.Spec.Ports = newService.Spec.Ports
 		service.Spec.SessionAffinity = newService.Spec.SessionAffinity
 		// Merge (not replace) Labels/Annotations so keys written by external controllers
@@ -1240,6 +1250,12 @@ func (r *MCPServerReconciler) deploymentForMCPServer(
 	ctx context.Context, m *mcpv1beta1.MCPServer, runConfigChecksum string,
 ) (*appsv1.Deployment, error) {
 	ls := labelsForMCPServer(m.Name)
+	tlsListener, err := ctrlutil.ResolveTLSListenerEnabled(
+		ctx, r.Client, m.Namespace, m.Spec.ExternalAuthConfigRef, m.Spec.AuthServerRef,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve auth server TLS listener: %w", err)
+	}
 
 	// Prepare container args
 	args := []string{"run"}
@@ -1464,7 +1480,7 @@ func (r *MCPServerReconciler) deploymentForMCPServer(
 	}
 
 	// Mount the session storage Redis CA bundle when TLS references one.
-	sessionTLSVolumes, sessionTLSMounts := ctrlutil.SessionRedisTLSVolumes(m.Spec.SessionStorage)
+	sessionTLSVolumes, sessionTLSMounts := ctrlutil.SessionRedisTLSVolumesWithDefault(m.Spec.SessionStorage, r.DefaultRedisConfig)
 	volumes = append(volumes, sessionTLSVolumes...)
 	volumeMounts = append(volumeMounts, sessionTLSMounts...)
 
@@ -1513,12 +1529,12 @@ func (r *MCPServerReconciler) deploymentForMCPServer(
 	// Add RunConfig checksum annotation to trigger pod rollout when config changes
 	deploymentTemplateAnnotations = checksum.AddRunConfigChecksumToPodTemplate(deploymentTemplateAnnotations, runConfigChecksum)
 	if configName := ctrlutil.EmbeddedAuthServerConfigName(m.Spec.ExternalAuthConfigRef, m.Spec.AuthServerRef); configName != "" {
-		caChecksum, err := ctrlutil.EmbeddedAuthServerCABundleChecksum(ctx, r.Client, m.Namespace, configName)
+		caChecksum, err := ctrlutil.EmbeddedAuthServerConfigMapChecksum(ctx, r.Client, m.Namespace, configName)
 		if err != nil {
 			return nil, fmt.Errorf("failed to calculate auth server CA checksum: %w", err)
 		}
 		if caChecksum != "" {
-			deploymentTemplateAnnotations[ctrlutil.AuthServerCABundleChecksumAnnotation] = caChecksum
+			deploymentTemplateAnnotations[ctrlutil.AuthServerConfigMapChecksumAnnotation] = caChecksum
 		}
 	}
 
@@ -1602,11 +1618,7 @@ func (r *MCPServerReconciler) deploymentForMCPServer(
 						Env:          env,
 						VolumeMounts: volumeMounts,
 						Resources:    resources,
-						Ports: []corev1.ContainerPort{{
-							ContainerPort: m.GetProxyPort(),
-							Name:          "http",
-							Protocol:      corev1.ProtocolTCP,
-						}},
+						Ports:        ctrlutil.ProxyContainerPorts(m.GetProxyPort(), tlsListener),
 						StartupProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
 								HTTPGet: &corev1.HTTPGetAction{
@@ -1659,7 +1671,9 @@ func (r *MCPServerReconciler) deploymentForMCPServer(
 }
 
 // serviceForMCPServer returns a MCPServer Service object
-func (r *MCPServerReconciler) serviceForMCPServer(ctx context.Context, m *mcpv1beta1.MCPServer) *corev1.Service {
+func (r *MCPServerReconciler) serviceForMCPServer(
+	ctx context.Context, m *mcpv1beta1.MCPServer, tlsListener bool,
+) *corev1.Service {
 	ls := labelsForMCPServer(m.Name)
 
 	// we want to generate a service name that is unique for the proxy service
@@ -1696,12 +1710,7 @@ func (r *MCPServerReconciler) serviceForMCPServer(ctx context.Context, m *mcpv1b
 		Spec: corev1.ServiceSpec{
 			Selector:        ls, // Keep original labels for selector
 			SessionAffinity: sessionAffinity,
-			Ports: []corev1.ServicePort{{
-				Port:       m.GetProxyPort(),
-				TargetPort: intstr.FromInt(int(m.GetProxyPort())),
-				Protocol:   corev1.ProtocolTCP,
-				Name:       "http",
-			}},
+			Ports:           ctrlutil.ProxyServicePorts(m.GetProxyPort(), tlsListener),
 		},
 	}
 
@@ -1957,6 +1966,12 @@ func (r *MCPServerReconciler) deploymentNeedsUpdate(
 	if deployment == nil || mcpServer == nil {
 		return true
 	}
+	tlsListener, err := ctrlutil.ResolveTLSListenerEnabled(
+		ctx, r.Client, mcpServer.Namespace, mcpServer.Spec.ExternalAuthConfigRef, mcpServer.Spec.AuthServerRef,
+	)
+	if err != nil {
+		return true
+	}
 	// Check if the container args have changed
 	if len(deployment.Spec.Template.Spec.Containers) > 0 {
 		container := deployment.Spec.Template.Spec.Containers[0]
@@ -1979,8 +1994,12 @@ func (r *MCPServerReconciler) deploymentNeedsUpdate(
 			return true
 		}
 
-		// Check if the container port has changed
-		if len(container.Ports) > 0 && container.Ports[0].ContainerPort != mcpServer.GetProxyPort() {
+		// Check if the operator-owned ports have changed
+		if ctrlutil.ContainerPortsDrifted(
+			container.Ports,
+			ctrlutil.ProxyContainerPorts(mcpServer.GetProxyPort(), tlsListener),
+			ctrlutil.ProxyContainerPorts(mcpServer.GetProxyPort(), true),
+		) {
 			return true
 		}
 
@@ -2104,15 +2123,17 @@ func (r *MCPServerReconciler) deploymentNeedsUpdate(
 
 		// Add embedded auth server environment variables. AuthServerRef takes precedence;
 		// externalAuthConfigRef is used as a fallback (legacy path).
+		var wantAuthServerVolumes []corev1.Volume
 		if configName := ctrlutil.EmbeddedAuthServerConfigName(
 			mcpServer.Spec.ExternalAuthConfigRef, mcpServer.Spec.AuthServerRef,
 		); configName != "" {
-			_, _, authServerEnvVars, err := ctrlutil.GenerateAuthServerConfigByName(
+			authServerVolumes, _, authServerEnvVars, err := ctrlutil.GenerateAuthServerConfigByName(
 				ctx, r.Client, mcpServer.Namespace, configName,
 			)
 			if err != nil {
 				return true
 			}
+			wantAuthServerVolumes = authServerVolumes
 			expectedProxyEnv = append(expectedProxyEnv, authServerEnvVars...)
 		}
 		// Add default environment variables that are always injected
@@ -2121,8 +2142,12 @@ func (r *MCPServerReconciler) deploymentNeedsUpdate(
 			return true
 		}
 
-		wantSessionTLSVolumes, _ := ctrlutil.SessionRedisTLSVolumes(mcpServer.Spec.SessionStorage)
+		wantSessionTLSVolumes, _ := ctrlutil.SessionRedisTLSVolumesWithDefault(mcpServer.Spec.SessionStorage, r.DefaultRedisConfig)
 		if ctrlutil.SessionRedisTLSVolumeNeedsUpdate(deployment.Spec.Template.Spec.Volumes, wantSessionTLSVolumes) {
+			return true
+		}
+
+		if ctrlutil.AuthServerVolumesNeedUpdate(deployment.Spec.Template.Spec.Volumes, wantAuthServerVolumes) {
 			return true
 		}
 
@@ -2235,12 +2260,12 @@ func (r *MCPServerReconciler) deploymentNeedsUpdate(
 	configName := ctrlutil.EmbeddedAuthServerConfigName(
 		mcpServer.Spec.ExternalAuthConfigRef, mcpServer.Spec.AuthServerRef)
 	if configName != "" {
-		caChecksum, err := ctrlutil.EmbeddedAuthServerCABundleChecksum(ctx, r.Client, mcpServer.Namespace, configName)
+		caChecksum, err := ctrlutil.EmbeddedAuthServerConfigMapChecksum(ctx, r.Client, mcpServer.Namespace, configName)
 		if err != nil {
 			return true
 		}
 		if caChecksum != "" {
-			expectedPodTemplateAnnotations[ctrlutil.AuthServerCABundleChecksumAnnotation] = caChecksum
+			expectedPodTemplateAnnotations[ctrlutil.AuthServerConfigMapChecksumAnnotation] = caChecksum
 		}
 	}
 	// Mirrors deploymentForMCPServer: stamp the MCPServer generation so the
@@ -2265,7 +2290,7 @@ func (r *MCPServerReconciler) deploymentNeedsUpdate(
 		return true
 	}
 
-	const caChecksumKey = ctrlutil.AuthServerCABundleChecksumAnnotation
+	const caChecksumKey = ctrlutil.AuthServerConfigMapChecksumAnnotation
 	actualCAChecksum, actualCAChecksumSet := deployment.Spec.Template.Annotations[caChecksumKey]
 	expectedCAChecksum, expectedCAChecksumSet := expectedPodTemplateAnnotations[caChecksumKey]
 	if actualCAChecksumSet != expectedCAChecksumSet || actualCAChecksum != expectedCAChecksum {
@@ -2285,9 +2310,15 @@ func (r *MCPServerReconciler) deploymentNeedsUpdate(
 }
 
 // serviceNeedsUpdate checks if the service needs to be updated
-func serviceNeedsUpdate(service *corev1.Service, mcpServer *mcpv1beta1.MCPServer) bool {
-	// Check if the service port has changed
-	if len(service.Spec.Ports) > 0 && service.Spec.Ports[0].Port != mcpServer.GetProxyPort() {
+func serviceNeedsUpdate(
+	service *corev1.Service, mcpServer *mcpv1beta1.MCPServer, tlsListener bool,
+) bool {
+	// Check if the operator-owned ports have changed
+	if ctrlutil.ServicePortsDrifted(
+		service.Spec.Ports,
+		ctrlutil.ProxyServicePorts(mcpServer.GetProxyPort(), tlsListener),
+		ctrlutil.ProxyOwnedPortNames(),
+	) {
 		return true
 	}
 
@@ -3039,9 +3070,9 @@ func (r *MCPServerReconciler) validateSessionStorageForReplicas(ctx context.Cont
 
 // buildRedisPasswordEnvVar returns the THV_SESSION_REDIS_PASSWORD env var when
 // sessionStorage.provider == "redis" and passwordRef is set, or when
-// spec.sessionStorage is unset and TOOLHIVE_DEFAULT_REDIS_SECRET_NAME is set
-// via the global default; returns nil otherwise.
-func (*MCPServerReconciler) buildRedisPasswordEnvVar(m *mcpv1beta1.MCPServer) []corev1.EnvVar {
+// spec.sessionStorage is unset and the injected global default references a
+// password Secret; returns nil otherwise.
+func (r *MCPServerReconciler) buildRedisPasswordEnvVar(m *mcpv1beta1.MCPServer) []corev1.EnvVar {
 	if m.Spec.SessionStorage != nil {
 		if m.Spec.SessionStorage.Provider == mcpv1beta1.SessionStorageProviderRedis &&
 			m.Spec.SessionStorage.PasswordRef != nil {
@@ -3062,7 +3093,7 @@ func (*MCPServerReconciler) buildRedisPasswordEnvVar(m *mcpv1beta1.MCPServer) []
 		return nil
 	}
 
-	def := ctrlutil.ReadDefaultRedisConfig()
+	def := r.DefaultRedisConfig
 	if def == nil || def.SecretName == "" {
 		return nil
 	}
@@ -3327,7 +3358,7 @@ func (r *MCPServerReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&mcpv1beta1.MCPToolConfig{}, toolConfigHandler).
 		Watches(
 			&corev1.ConfigMap{},
-			handler.EnqueueRequestsFromMapFunc(r.mapAuthServerCABundleConfigMapToMCPServer),
+			handler.EnqueueRequestsFromMapFunc(r.mapAuthServerConfigMapToMCPServer),
 			builder.WithPredicates(configMapDataChangedPredicate()),
 		).
 		Complete(r)

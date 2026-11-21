@@ -5,17 +5,24 @@ package authserver
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"encoding/json"
 	"log/slog"
 	"math"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-jose/go-jose/v4"
+	"github.com/ory/fosite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 
+	"github.com/stacklok/toolhive/pkg/authserver/authorizationdetails"
 	servercrypto "github.com/stacklok/toolhive/pkg/authserver/server/crypto"
 	"github.com/stacklok/toolhive/pkg/authserver/server/keys"
 	"github.com/stacklok/toolhive/pkg/authserver/server/registration"
@@ -90,16 +97,30 @@ func TestValidateIssuerURL(t *testing.T) {
 	}
 }
 
+// validFileBundleSource is a bundle source the runtime can load. Validation
+// only checks the path shape, so the file need not exist.
+func validFileBundleSource() SPIFFEBundleSourceRunConfig {
+	return SPIFFEBundleSourceRunConfig{
+		Type: SPIFFEBundleSourceTypeFile,
+		File: &SPIFFEFileBundleSourceRunConfig{Path: "/etc/spiffe/bundle.json"},
+	}
+}
+
 // mustNewSPIFFETrustConfig builds a well-formed, non-empty *SPIFFETrustConfig
-// for tests asserting that Config.Validate() rejects it as not-yet-enforced.
+// for tests that need a populated trust configuration.
 func mustNewSPIFFETrustConfig(t *testing.T) *SPIFFETrustConfig {
+	t.Helper()
+	return mustNewSPIFFETrustConfigWithSource(t, validFileBundleSource())
+}
+
+func mustNewSPIFFETrustConfigWithSource(t *testing.T, source SPIFFEBundleSourceRunConfig) *SPIFFETrustConfig {
 	t.Helper()
 	trust, err := NewSPIFFETrustConfig(
 		[]SPIFFETrustDomainRunConfig{{
 			Name:         "production",
 			TrustDomain:  "example.org",
 			Methods:      []SPIFFEAuthenticationMethod{SPIFFEAuthenticationMethodX509},
-			BundleSource: validWorkloadAPIBundleSource(),
+			BundleSource: source,
 		}},
 		&InboundGrantsRunConfig{SPIFFEClientAuth: []SPIFFEClientAuthRunConfig{{
 			TrustDomainRef:   "production",
@@ -128,6 +149,15 @@ func TestConfigValidate(t *testing.T) {
 		TokenEndpoint:         "https://idp.example.com/token",
 	}
 	validUpstreams := []UpstreamConfig{{Name: "default", Type: UpstreamProviderTypeOAuth2, OAuth2Config: validUpstream}}
+	detailsRegistry, err := authorizationdetails.New(map[string]authorizationdetails.Type{
+		"example": {
+			GrantTypes: []string{oauthproto.GrantTypeTokenExchange},
+			Grant: func(_ context.Context, req authorizationdetails.Request) (authorizationdetails.Result, error) {
+				return authorizationdetails.Result{Entries: req.Entries}, nil
+			},
+		},
+	})
+	require.NoError(t, err)
 	validOIDCUpstream := &upstream.OIDCConfig{
 		CommonOAuthConfig: upstream.CommonOAuthConfig{ClientID: "c", RedirectURI: "https://example.com/cb"},
 		Issuer:            "https://accounts.google.com",
@@ -144,6 +174,8 @@ func TestConfigValidate(t *testing.T) {
 		{name: "nil HMAC secrets", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, Upstreams: validUpstreams}, wantErr: true, errMsg: "HMAC secrets are required"},
 		{name: "HMAC too short", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: shortHMAC, Upstreams: validUpstreams}, wantErr: true, errMsg: "HMAC secret must be at least 32 bytes"},
 		{name: "no upstreams", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC}, wantErr: true, errMsg: "at least one upstream is required"},
+		{name: "SPIFFE-only config without an upstream passes", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, AllowedAudiences: []string{"https://mcp.example.com"}, SPIFFETrust: mustNewSPIFFETrustConfig(t)}},
+		{name: "SPIFFE client_id equal to a delegate client_id rejected", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, AllowedAudiences: []string{"https://mcp.example.com"}, SPIFFETrust: mustNewSPIFFETrustConfig(t), DelegateClients: []DelegateClient{{ClientID: "agent-client", ClientSecret: "delegate-secret-0123456789-abcdefghij", Scopes: []string{"openid"}, Audiences: []string{"https://mcp.example.com"}}}}, wantErr: true, errMsg: `client_id "agent-client" is configured both as a SPIFFE client association and as a delegate client`},
 		{name: "nil upstream config", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: []UpstreamConfig{{Name: "test", Type: UpstreamProviderTypeOAuth2}}}, wantErr: true, errMsg: "oauth2_config is required"},
 		{name: "multiple upstreams", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: []UpstreamConfig{{Name: "first", Type: UpstreamProviderTypeOAuth2, OAuth2Config: validUpstream}, {Name: "second", Type: UpstreamProviderTypeOAuth2, OAuth2Config: validUpstream}}, AllowedAudiences: []string{"https://mcp.example.com"}}},
 		{name: "upstream_filter with single upstream rejected", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: validUpstreams, AllowedAudiences: []string{"https://mcp.example.com"}, UpstreamFilter: &stubChainFilter{}}, wantErr: true, errMsg: "upstream_filter is configured but has no effect"},
@@ -188,30 +220,48 @@ func TestConfigValidate(t *testing.T) {
 		{name: "CIMD enabled with valid bounds passes", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: validUpstreams, AllowedAudiences: []string{"https://mcp.example.com"}, CIMDEnabled: true, CIMDCacheMaxSize: 256, CIMDCacheFallbackTTL: 5 * time.Minute}},
 
 		// Confidential-client transport gate (same predicate RunConfig.Validate uses)
-		{name: "confidential clients combined with insecure HTTP rejects", config: Config{Issuer: "http://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: validUpstreams, AllowedAudiences: []string{"https://mcp.example.com"}, AllowConfidentialClientRegistration: true, InsecureAllowHTTP: true}, wantErr: true, errMsg: "allow_confidential_client_registration cannot be combined with insecure_allow_http"},
+		{name: "confidential clients combined with insecure HTTP rejects", config: Config{Issuer: "http://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: validUpstreams, AllowedAudiences: []string{"https://mcp.example.com"}, AllowConfidentialClientRegistration: true, InsecureAllowHTTP: true}, wantErr: true, errMsg: "confidential clients (allow_confidential_client_registration or delegate clients) cannot be combined with insecure_allow_http"},
 		{name: "private-key JWT registration combined with insecure HTTP passes (no secret to protect)", config: Config{Issuer: "http://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: validUpstreams, AllowedAudiences: []string{"https://mcp.example.com"}, AllowPrivateKeyJWTRegistration: true, InsecureAllowHTTP: true}},
 		{name: "private-key JWT registration combined with token exchange disabled rejects", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: validUpstreams, AllowedAudiences: []string{"https://mcp.example.com"}, AllowPrivateKeyJWTRegistration: true, DisableTokenExchange: true}, wantErr: true, errMsg: "token-exchange-only"},
 
+		{name: "SPIFFE association combined with token exchange disabled rejects", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, AllowedAudiences: []string{"https://mcp.example.com"}, SPIFFETrust: mustNewSPIFFETrustConfig(t), DisableTokenExchange: true}, wantErr: true, errMsg: "SPIFFE client associations require token exchange"},
+
+		// RefreshGrantHandlers
+		{name: "nil refresh grant handler rejected", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: validUpstreams, AllowedAudiences: []string{"https://mcp.example.com"}, RefreshGrantHandlers: []fosite.TokenEndpointHandler{&recordingRefreshHandler{}, nil}}, wantErr: true, errMsg: "refresh grant handler 1 is nil"},
+		{name: "typed-nil refresh grant handler rejected", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: validUpstreams, AllowedAudiences: []string{"https://mcp.example.com"}, RefreshGrantHandlers: []fosite.TokenEndpointHandler{(*recordingRefreshHandler)(nil)}}, wantErr: true, errMsg: "refresh grant handler 0 is nil"},
+		{name: "refresh grant handler accepted", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: validUpstreams, AllowedAudiences: []string{"https://mcp.example.com"}, RefreshGrantHandlers: []fosite.TokenEndpointHandler{&recordingRefreshHandler{}}}},
+
+		{name: "authorization details registry combined with token exchange disabled rejects", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: validUpstreams, AllowedAudiences: []string{"https://mcp.example.com"}, AuthorizationDetailsRegistry: detailsRegistry, DisableTokenExchange: true}, wantErr: true, errMsg: "authorization details registry requires token exchange"},
+		{name: "authorization details registry with token exchange enabled passes", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: validUpstreams, AllowedAudiences: []string{"https://mcp.example.com"}, AuthorizationDetailsRegistry: detailsRegistry}},
 		// Valid configs
 		{name: "valid minimal", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: validUpstreams, AllowedAudiences: []string{"https://mcp.example.com"}}},
 		{name: "valid nil key provider", config: Config{Issuer: "https://example.com", HMACSecrets: validHMAC, Upstreams: validUpstreams, AllowedAudiences: []string{"https://mcp.example.com"}}},
 		{name: "valid empty upstream name defaults", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: []UpstreamConfig{{Type: UpstreamProviderTypeOAuth2, OAuth2Config: validUpstream}}, AllowedAudiences: []string{"https://mcp.example.com"}}},
 		{name: "valid OIDC upstream", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: validOIDCUpstreams, AllowedAudiences: []string{"https://mcp.example.com"}}},
 
-		// SPIFFETrust is accepted by NewSPIFFETrustConfig as well-formed, but
-		// hard-rejected here too -- mirroring RunConfig.Validate's
-		// validateSPIFFENotYetEnforced -- since a caller that constructs
-		// Config directly (e.g. authserver.New) bypasses RunConfig entirely.
+		// SPIFFETrust is accepted by NewSPIFFETrustConfig as well-formed, and
+		// passes here too since a caller that constructs Config directly
+		// (e.g. authserver.New) bypasses RunConfig entirely.
 		{name: "nil SPIFFETrust passes", config: Config{Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC, Upstreams: validUpstreams, AllowedAudiences: []string{"https://mcp.example.com"}}},
 		{
-			name: "well-formed Config.SPIFFETrust is rejected as not yet enforced",
+			name: "well-formed Config.SPIFFETrust passes",
 			config: Config{
 				Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC,
 				Upstreams: validUpstreams, AllowedAudiences: []string{"https://mcp.example.com"},
 				SPIFFETrust: mustNewSPIFFETrustConfig(t),
 			},
+		},
+		{
+			name: "SPIFFE workload_api bundle source rejected",
+			config: Config{
+				Issuer: "https://example.com", KeyProvider: validKeyProvider, HMACSecrets: validHMAC,
+				Upstreams: validUpstreams, AllowedAudiences: []string{"https://mcp.example.com"},
+				SPIFFETrust: mustNewSPIFFETrustConfigWithSource(t, SPIFFEBundleSourceRunConfig{
+					Type: SPIFFEBundleSourceTypeWorkloadAPI, WorkloadAPI: &SPIFFEWorkloadAPIBundleSourceRunConfig{},
+				}),
+			},
 			wantErr: true,
-			errMsg:  "SPIFFE client authentication is not yet enforced",
+			errMsg:  `type "workload_api" is not supported by this build`,
 		},
 	}
 
@@ -220,6 +270,82 @@ func TestConfigValidate(t *testing.T) {
 			t.Parallel()
 			err := tt.config.Validate()
 			assertError(t, err, tt.wantErr, tt.errMsg)
+		})
+	}
+}
+
+// minimalValidConfig returns a Config that passes Validate, for tests that vary one field.
+func minimalValidConfig(t *testing.T) Config {
+	t.Helper()
+
+	return Config{
+		Issuer:      "https://issuer.example.com",
+		HMACSecrets: &servercrypto.HMACSecrets{Current: make([]byte, 32)},
+		Upstreams: []UpstreamConfig{{
+			Name: "default", Type: UpstreamProviderTypeOAuth2,
+			OAuth2Config: &upstream.OAuth2Config{
+				CommonOAuthConfig:     upstream.CommonOAuthConfig{ClientID: "client", RedirectURI: "https://issuer.example.com/callback"},
+				AuthorizationEndpoint: "https://idp.example.com/authorize",
+				TokenEndpoint:         "https://idp.example.com/token",
+			},
+		}},
+		AllowedAudiences: []string{"https://resource.example.com"},
+	}
+}
+
+func TestConfigValidateSubjectIdentifierAudiences(t *testing.T) {
+	t.Parallel()
+
+	base := minimalValidConfig(t)
+
+	tests := []struct {
+		name      string
+		audiences []string
+		wantErr   bool
+	}{
+		{name: "exact allowed URI", audiences: []string{"https://resource.example.com"}},
+		{name: "all is not special", audiences: []string{"all"}, wantErr: true},
+		{name: "URI outside allowed audiences", audiences: []string{"https://other.example.com"}, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := base
+			cfg.SubjectIdentifierAudiences = tc.audiences
+			err := cfg.Validate()
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestConfigValidateAccessTokenType(t *testing.T) {
+	t.Parallel()
+
+	base := minimalValidConfig(t)
+
+	tests := []struct {
+		name    string
+		typ     string
+		wantErr bool
+	}{
+		{name: "at+jwt is accepted", typ: "at+jwt"},
+		{name: "media type prefix is rejected", typ: "application/at+jwt", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := base
+			cfg.AccessTokenType = tc.typ
+			err := cfg.Validate()
+			if tc.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
 		})
 	}
 }
@@ -568,6 +694,17 @@ func TestOAuth2UpstreamRunConfigValidate(t *testing.T) {
 				TokenEndpointAuthMethod: oauthproto.TokenEndpointAuthMethodClientSecretBasic,
 			},
 		},
+		{
+			// The secret comes from the registration, so the method only
+			// selects how the client registers.
+			name: "client_secret_post with dcr_config and no secret source is valid",
+			config: OAuth2UpstreamRunConfig{
+				DCRConfig: &DCRUpstreamConfig{
+					DiscoveryURL: "https://idp.example.com/.well-known/oauth-authorization-server",
+				},
+				TokenEndpointAuthMethod: oauthproto.TokenEndpointAuthMethodClientSecretPost,
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -581,6 +718,32 @@ func TestOAuth2UpstreamRunConfigValidate(t *testing.T) {
 
 func TestRunConfigValidate(t *testing.T) {
 	t.Parallel()
+
+	x509Config := func(mutate func(*RunConfig)) RunConfig {
+		config := RunConfig{
+			Issuer:      "https://auth.example.org",
+			TLSListener: &TLSListenerRunConfig{CertFile: "cert", KeyFile: "key"},
+			SPIFFETrustDomains: []SPIFFETrustDomainRunConfig{{
+				Name:         "production",
+				TrustDomain:  "example.org",
+				Methods:      []SPIFFEAuthenticationMethod{SPIFFEAuthenticationMethodX509},
+				BundleSource: validFileBundleSource(),
+			}},
+			InboundGrants: &InboundGrantsRunConfig{SPIFFEClientAuth: []SPIFFEClientAuthRunConfig{{
+				TrustDomainRef:   "production",
+				PrincipalPattern: "spiffe://example.org/ns/default/*",
+				ClientID:         "agent-client",
+				Methods:          []SPIFFEAuthenticationMethod{SPIFFEAuthenticationMethodX509},
+				Audiences:        []string{"https://mcp.example.org/resource"},
+				Scopes:           []string{"openid"},
+				GrantTypes:       []string{SPIFFEGrantTypeTokenExchange},
+			}}},
+		}
+		if mutate != nil {
+			mutate(&config)
+		}
+		return config
+	}
 
 	tests := []struct {
 		name    string
@@ -696,33 +859,42 @@ func TestRunConfigValidate(t *testing.T) {
 				AllowPrivateKeyJWTRegistration: true,
 			},
 		},
-		// SPIFFE trust is accepted by ValidateSPIFFETrust as well-formed, but
-		// hard-rejected here until a real SVID verification consumer lands.
+		// SPIFFE trust is accepted by ValidateSPIFFETrust as well-formed and
+		// passes here too.
 		{
 			name:   "no SPIFFE trust domains passes",
 			config: RunConfig{},
 		},
 		{
-			name: "well-formed SPIFFE trust configuration is rejected as not yet enforced",
-			config: RunConfig{
-				SPIFFETrustDomains: []SPIFFETrustDomainRunConfig{{
-					Name:         "production",
-					TrustDomain:  "example.org",
-					Methods:      []SPIFFEAuthenticationMethod{SPIFFEAuthenticationMethodX509},
-					BundleSource: validWorkloadAPIBundleSource(),
-				}},
-				InboundGrants: &InboundGrantsRunConfig{SPIFFEClientAuth: []SPIFFEClientAuthRunConfig{{
-					TrustDomainRef:   "production",
-					PrincipalPattern: "spiffe://example.org/ns/default/*",
-					ClientID:         "agent-client",
-					Methods:          []SPIFFEAuthenticationMethod{SPIFFEAuthenticationMethodX509},
-					Audiences:        []string{"https://mcp.example.org/resource"},
-					Scopes:           []string{"openid"},
-					GrantTypes:       []string{SPIFFEGrantTypeTokenExchange},
-				}}},
-			},
+			name:   "well-formed SPIFFE trust configuration passes",
+			config: x509Config(nil),
+		},
+		{
+			name:    "X.509 association with an http issuer is rejected",
+			config:  x509Config(func(c *RunConfig) { c.Issuer = "http://auth.example.org" }),
 			wantErr: true,
-			errMsg:  "SPIFFE client authentication is not yet enforced",
+			errMsg:  "SPIFFE X.509 authentication requires an https issuer",
+		},
+		{
+			name: "JWT-only association with an http issuer passes",
+			config: x509Config(func(c *RunConfig) {
+				c.Issuer = "http://auth.example.org"
+				c.TLSListener = nil
+				c.SPIFFETrustDomains[0].Methods = []SPIFFEAuthenticationMethod{SPIFFEAuthenticationMethodJWT}
+				c.InboundGrants.SPIFFEClientAuth[0].Methods = []SPIFFEAuthenticationMethod{SPIFFEAuthenticationMethodJWT}
+			}),
+		},
+		{
+			name: "SPIFFE client_id equal to a delegate client_id is rejected",
+			config: x509Config(func(c *RunConfig) {
+				c.AllowedAudiences = []string{"https://mcp.example.org/resource"}
+				c.DelegateClients = []DelegateClientRunConfig{{
+					ClientID: "agent-client", ClientSecretEnvVar: "SECRET",
+					Scopes: []string{"openid"}, Audiences: []string{"https://mcp.example.org/resource"},
+				}}
+			}),
+			wantErr: true,
+			errMsg:  `client_id "agent-client" is configured both as a SPIFFE client association and as a delegate client`,
 		},
 	}
 
@@ -731,6 +903,89 @@ func TestRunConfigValidate(t *testing.T) {
 			t.Parallel()
 			err := tt.config.Validate()
 			assertError(t, err, tt.wantErr, tt.errMsg)
+		})
+	}
+}
+
+func TestUpstreamConfig_DisplayNameNeverFailsValidation(t *testing.T) {
+	t.Parallel()
+
+	newConfig := func(name, displayName string) Config {
+		return Config{
+			Issuer: "https://example.com", KeyProvider: keys.NewGeneratingProvider(keys.DefaultAlgorithm),
+			HMACSecrets:      &servercrypto.HMACSecrets{Current: make([]byte, 32)},
+			AllowedAudiences: []string{"https://mcp.example.com"},
+			Upstreams: []UpstreamConfig{{
+				Name: name, DisplayName: displayName, Type: UpstreamProviderTypeOAuth2,
+				OAuth2Config: &upstream.OAuth2Config{
+					CommonOAuthConfig:     upstream.CommonOAuthConfig{ClientID: "c", RedirectURI: "https://example.com/cb"},
+					AuthorizationEndpoint: "https://idp.example.com/authorize",
+					TokenEndpoint:         "https://idp.example.com/token",
+				},
+			}},
+		}
+	}
+	for name, displayName := range map[string]string{
+		"empty":           "",
+		"plain":           "Acme Okta",
+		"control runes":   "Acme\u202e\u200b\nOkta",
+		"whitespace only": " \t ",
+		"html":            "<script>alert(1)</script>",
+		"very long":       strings.Repeat("é", 1000),
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			cfg := newConfig("ffffffff-ffff-ffff-ffff-ffffffffffff", displayName)
+			require.NoError(t, cfg.Validate())
+		})
+	}
+	t.Run("name is still validated", func(t *testing.T) {
+		t.Parallel()
+		cfg := newConfig("Not_A_Label", "Acme Okta")
+		require.Error(t, cfg.Validate())
+	})
+}
+
+// TestRunConfig_DisplayNameRoundTrip pins the display_name key in YAML and JSON,
+// the form operators write in config files and ConfigMaps, and checks that an
+// unset display name is omitted on encode.
+func TestRunConfig_DisplayNameRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	const yamlDoc = `
+upstreams:
+  - name: okta
+    display_name: Acme Okta
+`
+	const jsonDoc = `{"upstreams":[{"name":"okta","display_name":"Acme Okta"}]}`
+	for _, tc := range []struct {
+		name      string
+		unmarshal func([]byte, any) error
+		marshal   func(any) ([]byte, error)
+		doc       string
+	}{
+		{name: "yaml", unmarshal: yaml.Unmarshal, marshal: yaml.Marshal, doc: yamlDoc},
+		{name: "json", unmarshal: json.Unmarshal, marshal: json.Marshal, doc: jsonDoc},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var decoded RunConfig
+			require.NoError(t, tc.unmarshal([]byte(tc.doc), &decoded))
+			require.Len(t, decoded.Upstreams, 1)
+			assert.Equal(t, "okta", decoded.Upstreams[0].Name)
+			assert.Equal(t, "Acme Okta", decoded.Upstreams[0].DisplayName)
+
+			encoded, err := tc.marshal(&decoded)
+			require.NoError(t, err)
+			assert.Contains(t, string(encoded), "display_name")
+			var reDecoded RunConfig
+			require.NoError(t, tc.unmarshal(encoded, &reDecoded))
+			assert.Equal(t, decoded.Upstreams, reDecoded.Upstreams)
+
+			decoded.Upstreams[0].DisplayName = ""
+			encoded, err = tc.marshal(&decoded)
+			require.NoError(t, err)
+			assert.NotContains(t, string(encoded), "display_name")
 		})
 	}
 }
@@ -959,14 +1214,139 @@ func TestDelegateClientRunConfigValidate(t *testing.T) {
 		clients []DelegateClientRunConfig
 		wantErr string
 	}{
-		{name: "valid", clients: []DelegateClientRunConfig{validClient}},
+		{name: "secret client without grant types or block keeps legacy trust", clients: []DelegateClientRunConfig{validClient}},
 		{name: "empty ID", clients: []DelegateClientRunConfig{{ClientSecretEnvVar: "SECRET", Scopes: validClient.Scopes, Audiences: validClient.Audiences}}, wantErr: "client_id is required"},
 		{name: "duplicate ID", clients: []DelegateClientRunConfig{validClient, validClient}, wantErr: "duplicate client_id"},
-		{name: "missing secret reference", clients: []DelegateClientRunConfig{{ClientID: "delegate", Scopes: validClient.Scopes, Audiences: validClient.Audiences}}, wantErr: "client_secret_file or client_secret_env_var is required"},
+		{name: "missing secret reference", clients: []DelegateClientRunConfig{{ClientID: "delegate", Scopes: validClient.Scopes, Audiences: validClient.Audiences}}, wantErr: "secret is required"},
 		{name: "missing scopes", clients: []DelegateClientRunConfig{{ClientID: "delegate", ClientSecretEnvVar: "SECRET", Audiences: validClient.Audiences}}, wantErr: "scopes is required"},
 		{name: "scope outside supported", clients: []DelegateClientRunConfig{{ClientID: "delegate", ClientSecretEnvVar: "SECRET", Scopes: []string{"admin"}, Audiences: validClient.Audiences}}, wantErr: `"admin" which is not in scopes_supported`},
 		{name: "missing audiences", clients: []DelegateClientRunConfig{{ClientID: "delegate", ClientSecretEnvVar: "SECRET", Scopes: validClient.Scopes}}, wantErr: "audiences is required"},
 		{name: "audience outside allowed", clients: []DelegateClientRunConfig{{ClientID: "delegate", ClientSecretEnvVar: "SECRET", Scopes: validClient.Scopes, Audiences: []string{"https://other.example.com"}}}, wantErr: "is not in allowed_audiences"},
+		{name: "private_key_jwt without token exchange block", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", TokenEndpointAuthMethod: "private_key_jwt", JWKSFile: "/keys/jwks.json",
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "private_key_jwt clients must declare a token_exchange block"},
+		{name: "private_key_jwt with jwks file", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", TokenEndpointAuthMethod: "private_key_jwt", JWKSFile: "/keys/jwks.json",
+			TokenExchange: &DelegateClientTokenExchange{SelfIssuedSubjectTokens: SelfIssuedSubjectTokensAny},
+			Scopes:        validClient.Scopes, Audiences: validClient.Audiences,
+		}}},
+		{name: "private_key_jwt without jwks file", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", TokenEndpointAuthMethod: "private_key_jwt",
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "jwks_file"},
+		{name: "private_key_jwt with a secret", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", TokenEndpointAuthMethod: "private_key_jwt", JWKSFile: "/keys/jwks.json",
+			ClientSecretEnvVar: "SECRET", Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "not allowed with private_key_jwt"},
+		{name: "jwks file with a secret method", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", ClientSecretEnvVar: "SECRET", JWKSFile: "/keys/jwks.json",
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "only allowed with"},
+		{name: "pinned secret method", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", TokenEndpointAuthMethod: "client_secret_post", ClientSecretEnvVar: "SECRET",
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}},
+		{name: "grant types without token exchange", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", ClientSecretEnvVar: "SECRET", GrantTypes: []string{"refresh_token"},
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "must include"},
+		{name: "authorization_code with redirect", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", ClientSecretEnvVar: "SECRET",
+			GrantTypes:    []string{"urn:ietf:params:oauth:grant-type:token-exchange", "authorization_code"},
+			RedirectURIs:  []string{"https://broker.example.com/callback"},
+			TokenExchange: &DelegateClientTokenExchange{SelfIssuedSubjectTokens: SelfIssuedSubjectTokensAny},
+			Scopes:        validClient.Scopes, Audiences: validClient.Audiences,
+		}}},
+		{name: "authorization_code without redirect", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", ClientSecretEnvVar: "SECRET",
+			GrantTypes: []string{"urn:ietf:params:oauth:grant-type:token-exchange", "authorization_code"},
+			Scopes:     validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "redirect_uris is required"},
+		{name: "redirect without authorization_code", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", ClientSecretEnvVar: "SECRET", RedirectURIs: []string{"https://broker.example.com/callback"},
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "only allowed with the authorization_code grant"},
+		{name: "token_exchange with source client and subject token audiences", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", ClientSecretEnvVar: "SECRET",
+			TokenExchange: &DelegateClientTokenExchange{
+				SelfIssuedSubjectTokens: SelfIssuedSubjectTokensRestricted,
+				AllowedSourceClients:    []string{"tui"}, SubjectTokenAudiences: []string{"https://mcp.example.com"},
+			},
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}},
+		{name: "token_exchange source client is another delegate client", clients: []DelegateClientRunConfig{
+			validClient,
+			{
+				ClientID: "broker", ClientSecretEnvVar: "SECRET",
+				TokenExchange: &DelegateClientTokenExchange{
+					SelfIssuedSubjectTokens: SelfIssuedSubjectTokensRestricted,
+					AllowedSourceClients:    []string{"delegate"},
+				},
+				Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+			},
+		}, wantErr: "configured delegate client"},
+		{name: "empty token_exchange block", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", ClientSecretEnvVar: "SECRET", TokenExchange: &DelegateClientTokenExchange{},
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "self_issued_subject_tokens is required"},
+		{name: "unsupported self_issued_subject_tokens", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", ClientSecretEnvVar: "SECRET",
+			TokenExchange: &DelegateClientTokenExchange{SelfIssuedSubjectTokens: "blanket"},
+			Scopes:        validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: `self_issued_subject_tokens "blanket" is not supported`},
+		{name: "grant_types without token_exchange block", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", ClientSecretEnvVar: "SECRET",
+			GrantTypes: []string{"urn:ietf:params:oauth:grant-type:token-exchange"},
+			Scopes:     validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "grant_types is set, so a token_exchange block"},
+		{name: "grant_types with explicit any", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", ClientSecretEnvVar: "SECRET",
+			GrantTypes:    []string{"urn:ietf:params:oauth:grant-type:token-exchange"},
+			TokenExchange: &DelegateClientTokenExchange{SelfIssuedSubjectTokens: SelfIssuedSubjectTokensAny},
+			Scopes:        validClient.Scopes, Audiences: validClient.Audiences,
+		}}},
+		{name: "empty grant_types without token_exchange block", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", ClientSecretEnvVar: "SECRET", GrantTypes: []string{},
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}},
+		{name: "restricted with no source clients", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", ClientSecretEnvVar: "SECRET",
+			GrantTypes: []string{"urn:ietf:params:oauth:grant-type:token-exchange"},
+			TokenExchange: &DelegateClientTokenExchange{
+				SelfIssuedSubjectTokens: SelfIssuedSubjectTokensRestricted, AllowedSourceClients: []string{},
+			},
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}},
+		{name: "any with source clients", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", ClientSecretEnvVar: "SECRET",
+			TokenExchange: &DelegateClientTokenExchange{
+				SelfIssuedSubjectTokens: SelfIssuedSubjectTokensAny, AllowedSourceClients: []string{"tui"},
+			},
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "allowed_source_clients is valid only with"},
+		{name: "any with subject token audiences", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", ClientSecretEnvVar: "SECRET",
+			TokenExchange: &DelegateClientTokenExchange{
+				SelfIssuedSubjectTokens: SelfIssuedSubjectTokensAny, SubjectTokenAudiences: []string{"https://mcp.example.com"},
+			},
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "subject_token_audiences is valid only with"},
+		{name: "empty subject token audiences list is unset", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", ClientSecretEnvVar: "SECRET",
+			TokenExchange: &DelegateClientTokenExchange{
+				SelfIssuedSubjectTokens: SelfIssuedSubjectTokensRestricted, SubjectTokenAudiences: []string{},
+			},
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}},
+		{name: "subject token audience not in allowed_audiences", clients: []DelegateClientRunConfig{{
+			ClientID: "delegate", ClientSecretEnvVar: "SECRET",
+			TokenExchange: &DelegateClientTokenExchange{
+				SelfIssuedSubjectTokens: SelfIssuedSubjectTokensRestricted,
+				SubjectTokenAudiences:   []string{"https://other.example.com"},
+			},
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: `token_exchange.subject_token_audiences "https://other.example.com" is not in allowed_audiences`},
 		// P4 (PR #6284 review): a URL-shaped client_id collides with CIMD
 		// client resolution (oauthproto.IsClientIDMetadataDocumentURL) — the
 		// CIMD decorator would shadow this pre-provisioned client on reads,
@@ -1005,6 +1385,237 @@ func TestDelegateClientRunConfigValidate(t *testing.T) {
 	}
 }
 
+// TestDelegateClientExchangeRefreshTokensValidate runs each exchange_refresh_tokens
+// rule through both the RunConfig path and the resolved Config path.
+func TestDelegateClientExchangeRefreshTokensValidate(t *testing.T) {
+	t.Parallel()
+
+	const (
+		audience = "https://mcp.example.com"
+		input    = "https://input.example.com"
+		secret   = "0123456789abcdef0123456789abcdef"
+	)
+	inputs := []string{input}
+	block := func(idJAG, refresh string) *DelegateClientExchangeRefreshTokens {
+		return &DelegateClientExchangeRefreshTokens{IDJAGMaxLifetime: idJAG, RefreshTokenMaxLifetime: refresh}
+	}
+
+	tests := []struct {
+		name             string
+		block            *DelegateClientExchangeRefreshTokens
+		subjectAudiences []string
+		noSources        bool
+		mode             SelfIssuedSubjectTokens
+		noAudiences      bool
+		clientAudiences  []string
+		grantTypes       []string
+		scopesSupported  []string
+		wantErr          string
+	}{
+		{name: "id-jag cap only", block: block("12h", ""), subjectAudiences: inputs},
+		{name: "scopes_supported with offline", block: block("12h", ""), subjectAudiences: inputs,
+			scopesSupported: []string{"openid", "offline"}},
+		{name: "scopes_supported without a refresh-token scope", block: block("12h", ""), subjectAudiences: inputs,
+			scopesSupported: []string{"openid", "profile"},
+			wantErr: "token_exchange.exchange_refresh_tokens requires one of the refresh-token scopes " +
+				"(offline, offline_access) in scopes_supported"},
+		{name: "scopes_supported empty uses the default scopes", block: block("12h", ""), subjectAudiences: inputs,
+			scopesSupported: []string{}},
+		{name: "scopes_supported without a refresh-token scope and no block", block: nil, subjectAudiences: inputs,
+			scopesSupported: []string{"openid"}},
+		{name: "refresh cap only", block: block("", "720h"), subjectAudiences: inputs,
+			wantErr: "refresh_token_max_lifetime requires id_jag_max_lifetime"},
+		{name: "both caps", block: block("1h", "24h"), subjectAudiences: inputs},
+		{name: "absent block", block: nil, subjectAudiences: inputs},
+		{name: "no caps", block: block("", ""), subjectAudiences: inputs,
+			wantErr: "needs id_jag_max_lifetime or refresh_token_max_lifetime"},
+		{name: "zero id-jag cap", block: block("0s", ""), subjectAudiences: inputs,
+			wantErr: "id_jag_max_lifetime must be positive"},
+		{name: "zero refresh cap without unit", block: block("", "0"), subjectAudiences: inputs,
+			wantErr: "refresh_token_max_lifetime must be positive"},
+		{name: "negative id-jag cap", block: block("-1h", ""), subjectAudiences: inputs,
+			wantErr: "id_jag_max_lifetime must be positive"},
+		{name: "negative refresh cap", block: block("", "-1s"), subjectAudiences: inputs,
+			wantErr: "refresh_token_max_lifetime must be positive"},
+		{name: "id-jag cap above 720h", block: block("721h", ""), subjectAudiences: inputs,
+			wantErr: "id_jag_max_lifetime must not exceed 720h"},
+		{name: "refresh cap above 720h", block: block("", "1000h"), subjectAudiences: inputs,
+			wantErr: "refresh_token_max_lifetime must not exceed 720h"},
+		{name: "both caps exactly 720h", block: block("720h", "720h"), subjectAudiences: inputs},
+		{name: "id-jag cap one nanosecond over 720h", block: block("720h0m0.000000001s", ""), subjectAudiences: inputs,
+			wantErr: "id_jag_max_lifetime must not exceed 720h"},
+		{name: "refresh cap one nanosecond over 720h", block: block("", "720h0m0.000000001s"), subjectAudiences: inputs,
+			wantErr: "refresh_token_max_lifetime must not exceed 720h"},
+		{name: "id-jag cap with leading space", block: block(" 12h", ""), subjectAudiences: inputs,
+			wantErr: "invalid duration"},
+		{name: "refresh cap with trailing space", block: block("", "12h "), subjectAudiences: inputs,
+			wantErr: "unknown unit"},
+		{name: "id-jag cap without unit", block: block("12", ""), subjectAudiences: inputs,
+			wantErr: "missing unit"},
+		{name: "unparsable cap", block: block("soon", ""), subjectAudiences: inputs,
+			wantErr: "token_exchange.exchange_refresh_tokens.id_jag_max_lifetime"},
+		{name: "subject token audiences missing", block: block("12h", ""),
+			wantErr: "subject_token_audiences is required with token_exchange.exchange_refresh_tokens"},
+		{name: "allowed source clients missing", block: block("12h", ""), subjectAudiences: inputs, noSources: true,
+			wantErr: "allowed_source_clients is required with token_exchange.exchange_refresh_tokens"},
+		{name: "any mode", block: block("12h", ""), mode: SelfIssuedSubjectTokensAny,
+			wantErr: `token_exchange.exchange_refresh_tokens requires self_issued_subject_tokens "restricted"`},
+		{name: "any mode with subject token audiences", block: block("12h", ""), subjectAudiences: inputs,
+			mode: SelfIssuedSubjectTokensAny, wantErr: "token_exchange.subject_token_audiences is valid only with"},
+		{name: "any mode without block", block: nil, mode: SelfIssuedSubjectTokensAny},
+		{name: "empty audiences with grant_types omitted", block: block("12h", ""), subjectAudiences: inputs,
+			noAudiences: true},
+		{name: "empty audiences with only the token-exchange grant", block: block("12h", ""),
+			subjectAudiences: inputs, noAudiences: true,
+			grantTypes: []string{oauthproto.GrantTypeTokenExchange}},
+		{name: "empty audiences with jwt-bearer", block: block("12h", ""), subjectAudiences: inputs,
+			noAudiences: true, grantTypes: []string{oauthproto.GrantTypeTokenExchange, oauthproto.GrantTypeJWTBearer},
+			wantErr: "audiences must not be empty when grant_types includes grants other than " +
+				oauthproto.GrantTypeTokenExchange},
+		{name: "empty audiences with authorization_code", block: block("12h", ""), subjectAudiences: inputs,
+			noAudiences: true, grantTypes: []string{oauthproto.GrantTypeTokenExchange, oauthproto.GrantTypeAuthorizationCode},
+			wantErr: "audiences must not be empty when grant_types includes grants other than"},
+		{name: "empty audiences without a block", block: nil, noAudiences: true,
+			wantErr: "audiences is required unless token_exchange.exchange_refresh_tokens is set"},
+		{name: "input audience equal to a client audience", block: block("12h", ""),
+			subjectAudiences: []string{audience},
+			wantErr: `subject_token_audiences "https://mcp.example.com" is covered by the client's audience ` +
+				`"https://mcp.example.com": while exchange_refresh_tokens is set, an input audience must not be one the client can obtain`},
+		{name: "input audience under a client audience path", block: block("12h", ""),
+			subjectAudiences: []string{audience + "/v1"}, wantErr: "is covered by the client's audience"},
+		{name: "input audience outside allowed_audiences", block: block("12h", ""),
+			subjectAudiences: []string{"https://elsewhere.example.com"}, wantErr: "is not in allowed_audiences"},
+		{name: "equal non-URL audiences", block: block("12h", ""), clientAudiences: []string{"not-a-url"},
+			subjectAudiences: []string{"not-a-url"}, wantErr: "is covered by the client's audience"},
+		{name: "different non-URL audiences", block: block("12h", ""), clientAudiences: []string{"not-a-url"},
+			subjectAudiences: []string{"other-not-a-url"}},
+		{name: "overlap is allowed without the block", block: nil, subjectAudiences: []string{audience}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			mode := tt.mode
+			if mode == "" {
+				mode = SelfIssuedSubjectTokensRestricted
+			}
+			tokenExchange := &DelegateClientTokenExchange{
+				SelfIssuedSubjectTokens: mode,
+				SubjectTokenAudiences:   tt.subjectAudiences,
+				ExchangeRefreshTokens:   tt.block,
+			}
+			if tt.block != nil && !tt.noSources && mode == SelfIssuedSubjectTokensRestricted {
+				tokenExchange.AllowedSourceClients = []string{"tui"}
+			}
+			audiences := []string{audience}
+			switch {
+			case tt.noAudiences:
+				audiences = nil
+			case tt.clientAudiences != nil:
+				audiences = tt.clientAudiences
+			}
+			allowed := []string{audience, audience + "/v1", input, "not-a-url", "other-not-a-url"}
+			supported := tt.scopesSupported
+			if supported == nil {
+				supported = []string{"openid", "offline_access"}
+			}
+			runConfigClients := []DelegateClientRunConfig{{
+				ClientID: "delegate", ClientSecretEnvVar: "SECRET", TokenExchange: tokenExchange,
+				GrantTypes: tt.grantTypes, RedirectURIs: redirectURIsFor(tt.grantTypes),
+				Scopes: []string{"openid"}, Audiences: audiences,
+			}}
+			assertError(t, validateDelegateClients(runConfigClients, supported, allowed, "https://auth.example.com", true),
+				tt.wantErr != "", tt.wantErr)
+
+			resolvedClients := []DelegateClient{{
+				ClientID: "delegate", ClientSecret: secret, TokenExchange: tokenExchange,
+				GrantTypes: tt.grantTypes, RedirectURIs: redirectURIsFor(tt.grantTypes),
+				Scopes: []string{"openid"}, Audiences: audiences,
+			}}
+			assertError(t, validateResolvedDelegateClients(resolvedClients, supported, allowed, "https://auth.example.com", true),
+				tt.wantErr != "", tt.wantErr)
+		})
+	}
+}
+
+// redirectURIsFor returns a redirect URI for a grant set that includes
+// authorization_code, which requires one.
+func redirectURIsFor(grantTypes []string) []string {
+	if slices.Contains(grantTypes, oauthproto.GrantTypeAuthorizationCode) {
+		return []string{"https://broker.example.com/callback"}
+	}
+	return nil
+}
+
+func TestDelegateClientExchangeRefreshTokensRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		json     string
+		yaml     string
+		wantNil  bool
+		wantIDJA string
+		wantRefr string
+	}{
+		{
+			name:    "absent",
+			json:    `{"client_id":"c","token_exchange":{"self_issued_subject_tokens":"restricted","subject_token_audiences":["a"]}}`,
+			yaml:    "client_id: c\ntoken_exchange:\n  self_issued_subject_tokens: restricted\n  subject_token_audiences: [a]\n",
+			wantNil: true,
+		},
+		{
+			name:     "populated",
+			json:     `{"client_id":"c","token_exchange":{"self_issued_subject_tokens":"restricted","subject_token_audiences":["a"],"exchange_refresh_tokens":{"id_jag_max_lifetime":"12h","refresh_token_max_lifetime":"720h"}}}`,
+			yaml:     "client_id: c\ntoken_exchange:\n  self_issued_subject_tokens: restricted\n  subject_token_audiences: [a]\n  exchange_refresh_tokens:\n    id_jag_max_lifetime: 12h\n    refresh_token_max_lifetime: 720h\n",
+			wantIDJA: "12h",
+			wantRefr: "720h",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			check := func(t *testing.T, got DelegateClientRunConfig) {
+				t.Helper()
+				require.NotNil(t, got.TokenExchange)
+				if tt.wantNil {
+					assert.Nil(t, got.TokenExchange.ExchangeRefreshTokens)
+					return
+				}
+				require.NotNil(t, got.TokenExchange.ExchangeRefreshTokens)
+				assert.Equal(t, tt.wantIDJA, got.TokenExchange.ExchangeRefreshTokens.IDJAGMaxLifetime)
+				assert.Equal(t, tt.wantRefr, got.TokenExchange.ExchangeRefreshTokens.RefreshTokenMaxLifetime)
+			}
+
+			var fromJSON DelegateClientRunConfig
+			require.NoError(t, json.Unmarshal([]byte(tt.json), &fromJSON))
+			check(t, fromJSON)
+			encoded, err := json.Marshal(fromJSON)
+			require.NoError(t, err)
+			if tt.wantNil {
+				assert.NotContains(t, string(encoded), "exchange_refresh_tokens")
+			}
+			var reJSON DelegateClientRunConfig
+			require.NoError(t, json.Unmarshal(encoded, &reJSON))
+			check(t, reJSON)
+
+			var fromYAML DelegateClientRunConfig
+			require.NoError(t, yaml.Unmarshal([]byte(tt.yaml), &fromYAML))
+			check(t, fromYAML)
+			encoded, err = yaml.Marshal(fromYAML)
+			require.NoError(t, err)
+			if tt.wantNil {
+				assert.NotContains(t, string(encoded), "exchange_refresh_tokens")
+			}
+			var reYAML DelegateClientRunConfig
+			require.NoError(t, yaml.Unmarshal(encoded, &reYAML))
+			check(t, reYAML)
+		})
+	}
+}
+
 func TestRunConfigValidateAllowedAudiences(t *testing.T) {
 	t.Parallel()
 
@@ -1014,6 +1625,59 @@ func TestRunConfigValidateAllowedAudiences(t *testing.T) {
 	}
 
 	require.ErrorContains(t, cfg.Validate(), "allowed_audiences contains invalid audience")
+}
+
+func TestRunConfigValidate_DelegateClientTransport(t *testing.T) {
+	t.Parallel()
+
+	secretClient := DelegateClientRunConfig{
+		ClientID: "secret-client", ClientSecretEnvVar: "SECRET",
+		Scopes: []string{"openid"}, Audiences: []string{"https://mcp.example.com"},
+	}
+	keyClient := DelegateClientRunConfig{
+		ClientID: "key-client", TokenEndpointAuthMethod: "private_key_jwt", JWKSFile: "/keys/jwks.json",
+		TokenExchange: &DelegateClientTokenExchange{SelfIssuedSubjectTokens: SelfIssuedSubjectTokensAny},
+		Scopes:        []string{"openid"}, Audiences: []string{"https://mcp.example.com"},
+	}
+	tests := []struct {
+		name              string
+		clients           []DelegateClientRunConfig
+		issuer            string
+		insecureAllowHTTP bool
+		loopbackOptIn     bool
+		wantErr           string
+	}{
+		{name: "private_key_jwt only rejects non-loopback http issuer", clients: []DelegateClientRunConfig{keyClient},
+			issuer: "http://auth.example.com", insecureAllowHTTP: true, wantErr: "combined with insecure_allow_http:"},
+		{name: "private_key_jwt only rejects loopback http issuer without opt-in", clients: []DelegateClientRunConfig{keyClient},
+			issuer: "http://localhost:8080", wantErr: "insecure_allow_confidential_over_loopback_http"},
+		{name: "private_key_jwt only passes with loopback http issuer and opt-in", clients: []DelegateClientRunConfig{keyClient},
+			issuer: "http://localhost:8080", loopbackOptIn: true},
+		{name: "mixed secret and private_key_jwt rejects non-loopback http issuer",
+			clients: []DelegateClientRunConfig{keyClient, secretClient},
+			issuer:  "http://auth.example.com", insecureAllowHTTP: true, wantErr: "combined with insecure_allow_http:"},
+		{name: "mixed secret and private_key_jwt rejects loopback http issuer without opt-in",
+			clients: []DelegateClientRunConfig{keyClient, secretClient},
+			issuer:  "http://localhost:8080", wantErr: "insecure_allow_confidential_over_loopback_http"},
+		{name: "secret only rejects non-loopback http issuer", clients: []DelegateClientRunConfig{secretClient},
+			issuer: "http://auth.example.com", insecureAllowHTTP: true, wantErr: "combined with insecure_allow_http:"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := RunConfig{
+				Issuer:            tt.issuer,
+				InsecureAllowHTTP: tt.insecureAllowHTTP,
+				ScopesSupported:   []string{"openid"},
+				AllowedAudiences:  []string{"https://mcp.example.com"},
+				DelegateClients:   tt.clients,
+
+				InsecureAllowConfidentialOverLoopbackHTTP: tt.loopbackOptIn,
+			}
+			assertError(t, cfg.Validate(), tt.wantErr != "", tt.wantErr)
+		})
+	}
 }
 
 func TestConfigValidateDelegateClients(t *testing.T) {
@@ -1042,17 +1706,97 @@ func TestConfigValidateDelegateClients(t *testing.T) {
 		Scopes:       []string{"openid"},
 		Audiences:    []string{"https://mcp.example.com"},
 	}
+	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	require.NoError(t, err)
+	publicKeySet := &jose.JSONWebKeySet{Keys: []jose.JSONWebKey{{
+		Key: &rsaKey.PublicKey, KeyID: "k", Use: "sig", Algorithm: "RS256",
+	}}}
 	tests := []struct {
-		name    string
-		clients []DelegateClient
-		issuer  string
-		wantErr string
+		name          string
+		clients       []DelegateClient
+		issuer        string
+		loopbackOptIn bool
+		wantErr       string
 	}{
 		{name: "valid resolved client", clients: []DelegateClient{validClient}},
+		{name: "resolved private_key_jwt client without token exchange block", clients: []DelegateClient{{
+			ClientID: "delegate", TokenEndpointAuthMethod: "private_key_jwt", JSONWebKeys: publicKeySet,
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "private_key_jwt clients must declare a token_exchange block"},
+		{name: "resolved private_key_jwt client", clients: []DelegateClient{{
+			ClientID: "delegate", TokenEndpointAuthMethod: "private_key_jwt", JSONWebKeys: publicKeySet,
+			TokenExchange: &DelegateClientTokenExchange{SelfIssuedSubjectTokens: SelfIssuedSubjectTokensAny},
+			Scopes:        validClient.Scopes, Audiences: validClient.Audiences,
+		}}},
+		{name: "private_key_jwt with nil keys", clients: []DelegateClient{{
+			ClientID: "delegate", TokenEndpointAuthMethod: "private_key_jwt",
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "requires jwks_file with at least one key"},
+		{name: "private_key_jwt with empty keys", clients: []DelegateClient{{
+			ClientID: "delegate", TokenEndpointAuthMethod: "private_key_jwt", JSONWebKeys: &jose.JSONWebKeySet{},
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "requires jwks_file with at least one key"},
+		{name: "private_key_jwt with a secret", clients: []DelegateClient{{
+			ClientID: "delegate", TokenEndpointAuthMethod: "private_key_jwt", JSONWebKeys: publicKeySet,
+			ClientSecret: validClient.ClientSecret, Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "not allowed with private_key_jwt"},
+		{name: "grant types without token exchange", clients: []DelegateClient{{
+			ClientID: "delegate", ClientSecret: validClient.ClientSecret, GrantTypes: []string{"refresh_token"},
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "must include"},
+		{name: "authorization_code without redirect URIs", clients: []DelegateClient{{
+			ClientID: "delegate", ClientSecret: validClient.ClientSecret,
+			GrantTypes: []string{"urn:ietf:params:oauth:grant-type:token-exchange", "authorization_code"},
+			Scopes:     validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "redirect_uris is required"},
+		{name: "redirect URIs without authorization_code", clients: []DelegateClient{{
+			ClientID: "delegate", ClientSecret: validClient.ClientSecret, RedirectURIs: []string{"https://broker.example.com/callback"},
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "only allowed with the authorization_code grant"},
+		{name: "resolved grant_types without token_exchange block", clients: []DelegateClient{{
+			ClientID: "delegate", ClientSecret: validClient.ClientSecret,
+			GrantTypes: []string{"urn:ietf:params:oauth:grant-type:token-exchange"},
+			Scopes:     validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "grant_types is set, so a token_exchange block"},
+		{name: "resolved empty token_exchange block", clients: []DelegateClient{{
+			ClientID: "delegate", ClientSecret: validClient.ClientSecret, TokenExchange: &DelegateClientTokenExchange{},
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "self_issued_subject_tokens is required"},
+		{name: "resolved any with source clients", clients: []DelegateClient{{
+			ClientID: "delegate", ClientSecret: validClient.ClientSecret,
+			TokenExchange: &DelegateClientTokenExchange{
+				SelfIssuedSubjectTokens: SelfIssuedSubjectTokensAny, AllowedSourceClients: []string{"tui"},
+			},
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "allowed_source_clients is valid only with"},
+		{name: "unsupported auth method", clients: []DelegateClient{{
+			ClientID: "delegate", ClientSecret: validClient.ClientSecret, TokenEndpointAuthMethod: "none",
+			Scopes: validClient.Scopes, Audiences: validClient.Audiences,
+		}}, wantErr: "unsupported token_endpoint_auth_method"},
 		{name: "missing resolved secret", clients: []DelegateClient{{ClientID: "delegate", Scopes: validClient.Scopes, Audiences: validClient.Audiences}}, wantErr: "resolved client secret is required"},
 		{name: "resolved secret too short", clients: []DelegateClient{{ClientID: "delegate", ClientSecret: "short-secret", Scopes: validClient.Scopes, Audiences: validClient.Audiences}}, wantErr: "resolved client secret must be at least"},
-		{name: "static client rejects insecure HTTP", clients: []DelegateClient{validClient}, issuer: "http://auth.example.com", wantErr: "confidential clients would send secrets over cleartext HTTP"},
+		{name: "static client rejects insecure HTTP", clients: []DelegateClient{validClient}, issuer: "http://auth.example.com", wantErr: "combined with insecure_allow_http:"},
 		{name: "static client rejects loopback HTTP without opt-in", clients: []DelegateClient{validClient}, issuer: "http://localhost:8080", wantErr: "insecure_allow_confidential_over_loopback_http"},
+		{name: "private_key_jwt only rejects insecure HTTP", clients: []DelegateClient{{
+			ClientID: "delegate", TokenEndpointAuthMethod: "private_key_jwt", JSONWebKeys: publicKeySet,
+			TokenExchange: &DelegateClientTokenExchange{SelfIssuedSubjectTokens: SelfIssuedSubjectTokensAny},
+			Scopes:        validClient.Scopes, Audiences: validClient.Audiences,
+		}}, issuer: "http://auth.example.com", wantErr: "combined with insecure_allow_http:"},
+		{name: "private_key_jwt only rejects loopback HTTP without opt-in", clients: []DelegateClient{{
+			ClientID: "delegate", TokenEndpointAuthMethod: "private_key_jwt", JSONWebKeys: publicKeySet,
+			TokenExchange: &DelegateClientTokenExchange{SelfIssuedSubjectTokens: SelfIssuedSubjectTokensAny},
+			Scopes:        validClient.Scopes, Audiences: validClient.Audiences,
+		}}, issuer: "http://localhost:8080", wantErr: "insecure_allow_confidential_over_loopback_http"},
+		{name: "private_key_jwt only passes with loopback HTTP and opt-in", clients: []DelegateClient{{
+			ClientID: "delegate", TokenEndpointAuthMethod: "private_key_jwt", JSONWebKeys: publicKeySet,
+			TokenExchange: &DelegateClientTokenExchange{SelfIssuedSubjectTokens: SelfIssuedSubjectTokensAny},
+			Scopes:        validClient.Scopes, Audiences: validClient.Audiences,
+		}}, issuer: "http://localhost:8080", loopbackOptIn: true},
+		{name: "mixed secret and private_key_jwt rejects insecure HTTP", clients: []DelegateClient{validClient, {
+			ClientID: "key-delegate", TokenEndpointAuthMethod: "private_key_jwt", JSONWebKeys: publicKeySet,
+			TokenExchange: &DelegateClientTokenExchange{SelfIssuedSubjectTokens: SelfIssuedSubjectTokensAny},
+			Scopes:        validClient.Scopes, Audiences: validClient.Audiences,
+		}}, issuer: "http://auth.example.com", wantErr: "combined with insecure_allow_http:"},
 	}
 
 	for _, tt := range tests {
@@ -1064,6 +1808,7 @@ func TestConfigValidateDelegateClients(t *testing.T) {
 				cfg.Issuer = tt.issuer
 				cfg.InsecureAllowHTTP = tt.issuer == "http://auth.example.com"
 			}
+			cfg.InsecureAllowConfidentialOverLoopbackHTTP = tt.loopbackOptIn
 			err := cfg.Validate()
 			assertError(t, err, tt.wantErr != "", tt.wantErr)
 			if err != nil && tt.name == "resolved secret too short" {
@@ -1146,7 +1891,7 @@ func TestValidateConfidentialClientTransport(t *testing.T) {
 		{
 			name:              "confidential with plain-HTTP non-loopback issuer rejects with loopback opt-in",
 			allowConfidential: true, issuer: "http://auth.example.com", allowLoopbackOverride: true,
-			wantErr: true, errContains: "non-loopback issuer",
+			wantErr: true, errContains: "loopback HTTP opt-in",
 		},
 	}
 
@@ -1319,6 +2064,54 @@ func TestDCRUpstreamConfigValidate(t *testing.T) {
 			},
 			wantErr: true,
 			errMsg:  "rotation_key must be 1-64 characters",
+		},
+		{
+			name: "registration_probe authorizationEndpoint accepts",
+			config: DCRUpstreamConfig{
+				RegistrationEndpoint: "https://idp.example.com/register",
+				RegistrationProbe:    "authorizationEndpoint",
+			},
+		},
+		{
+			name: "registration_probe none accepts",
+			config: DCRUpstreamConfig{
+				RegistrationEndpoint: "https://idp.example.com/register",
+				RegistrationProbe:    "none",
+			},
+		},
+		{
+			name: "unknown registration_probe rejects",
+			config: DCRUpstreamConfig{
+				RegistrationEndpoint: "https://idp.example.com/register",
+				RegistrationProbe:    "userinfo",
+			},
+			wantErr: true,
+			errMsg:  "registration_probe must be one of",
+		},
+		{
+			name: "registration_probe_interval of 5m accepts",
+			config: DCRUpstreamConfig{
+				RegistrationEndpoint:      "https://idp.example.com/register",
+				RegistrationProbeInterval: "5m",
+			},
+		},
+		{
+			name: "registration_probe_interval under 1m rejects",
+			config: DCRUpstreamConfig{
+				RegistrationEndpoint:      "https://idp.example.com/register",
+				RegistrationProbeInterval: "59s",
+			},
+			wantErr: true,
+			errMsg:  "registration_probe_interval must be at least 1m0s",
+		},
+		{
+			name: "unparsable registration_probe_interval rejects",
+			config: DCRUpstreamConfig{
+				RegistrationEndpoint:      "https://idp.example.com/register",
+				RegistrationProbeInterval: "five minutes",
+			},
+			wantErr: true,
+			errMsg:  "invalid registration_probe_interval",
 		},
 		{
 			name: "both initial_access_token_file and initial_access_token_env_var rejects",
@@ -2072,6 +2865,51 @@ func TestRunConfigValidateTLSListener(t *testing.T) {
 	}
 }
 
+func TestRunConfigValidateX509RequiresTLSListener(t *testing.T) {
+	t.Parallel()
+
+	association := func(method SPIFFEAuthenticationMethod) *InboundGrantsRunConfig {
+		return &InboundGrantsRunConfig{SPIFFEClientAuth: []SPIFFEClientAuthRunConfig{{
+			Methods: []SPIFFEAuthenticationMethod{method},
+		}}}
+	}
+	const listenerRule = "tls_listener is required"
+
+	tests := []struct {
+		name string
+		cfg  RunConfig
+		// wantListenerRule is whether Validate must fail on the listener rule.
+		// When false, Validate may still fail on an unrelated check.
+		wantListenerRule bool
+	}{
+		{
+			name:             "x509 association without listener",
+			cfg:              RunConfig{InboundGrants: association(SPIFFEAuthenticationMethodX509)},
+			wantListenerRule: true,
+		},
+		{
+			name: "x509 association with listener",
+			cfg: RunConfig{
+				InboundGrants: association(SPIFFEAuthenticationMethodX509),
+				TLSListener:   &TLSListenerRunConfig{CertFile: "cert", KeyFile: "key"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := tt.cfg.Validate()
+			if tt.wantListenerRule {
+				require.EqualError(t, err, "tls_listener is required when a SPIFFE client association enables spiffe_x509")
+				return
+			}
+			if err != nil {
+				assert.NotContains(t, err.Error(), listenerRule)
+			}
+		})
+	}
+}
+
 func TestHasSPIFFEX509ClientAuth(t *testing.T) {
 	t.Parallel()
 
@@ -2205,6 +3043,269 @@ func TestRunConfigValidateDCRRegistrationLimits(t *testing.T) {
 				return
 			}
 			require.ErrorContains(t, err, tt.wantErrMsg)
+		})
+	}
+}
+
+func TestDelegateClientRunConfigTokenExchangeRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name       string
+		json       string
+		yaml       string
+		wantNil    bool
+		wantMode   SelfIssuedSubjectTokens
+		wantSource []string
+		wantAud    []string
+	}{
+		{name: "absent", json: `{"client_id":"c"}`, yaml: "client_id: c\n", wantNil: true},
+		{name: "null", json: `{"client_id":"c","token_exchange":null}`, yaml: "client_id: c\ntoken_exchange:\n", wantNil: true},
+		{name: "empty block", json: `{"client_id":"c","token_exchange":{}}`, yaml: "client_id: c\ntoken_exchange: {}\n"},
+		{
+			name: "populated",
+			json: `{"client_id":"c","token_exchange":{"self_issued_subject_tokens":"restricted",` +
+				`"allowed_source_clients":["tui"],"subject_token_audiences":["a"]}}`,
+			yaml: "client_id: c\ntoken_exchange:\n  self_issued_subject_tokens: restricted\n" +
+				"  allowed_source_clients: [tui]\n  subject_token_audiences: [a]\n",
+			wantMode:   SelfIssuedSubjectTokensRestricted,
+			wantSource: []string{"tui"},
+			wantAud:    []string{"a"},
+		},
+		{
+			name:     "subject token audiences omitted",
+			json:     `{"client_id":"c","token_exchange":{"self_issued_subject_tokens":"restricted"}}`,
+			yaml:     "client_id: c\ntoken_exchange:\n  self_issued_subject_tokens: restricted\n",
+			wantMode: SelfIssuedSubjectTokensRestricted,
+		},
+		{
+			name: "multiple subject token audiences",
+			json: `{"client_id":"c","token_exchange":{"self_issued_subject_tokens":"restricted",` +
+				`"subject_token_audiences":["a","b"]}}`,
+			yaml: "client_id: c\ntoken_exchange:\n  self_issued_subject_tokens: restricted\n" +
+				"  subject_token_audiences: [a, b]\n",
+			wantMode: SelfIssuedSubjectTokensRestricted,
+			wantAud:  []string{"a", "b"},
+		},
+		{
+			name: "explicit empty subject token audiences",
+			json: `{"client_id":"c","token_exchange":{"self_issued_subject_tokens":"restricted",` +
+				`"subject_token_audiences":[]}}`,
+			yaml: "client_id: c\ntoken_exchange:\n  self_issued_subject_tokens: restricted\n" +
+				"  subject_token_audiences: []\n",
+			wantMode: SelfIssuedSubjectTokensRestricted,
+		},
+		{
+			name:     "explicit any",
+			json:     `{"client_id":"c","token_exchange":{"self_issued_subject_tokens":"any"}}`,
+			yaml:     "client_id: c\ntoken_exchange:\n  self_issued_subject_tokens: any\n",
+			wantMode: SelfIssuedSubjectTokensAny,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			check := func(t *testing.T, got DelegateClientRunConfig) {
+				t.Helper()
+				if tt.wantNil {
+					assert.Nil(t, got.TokenExchange)
+					return
+				}
+				require.NotNil(t, got.TokenExchange)
+				assert.Equal(t, tt.wantMode, got.TokenExchange.SelfIssuedSubjectTokens)
+				assert.Equal(t, tt.wantSource, got.TokenExchange.AllowedSourceClients)
+				if len(tt.wantAud) == 0 {
+					assert.Empty(t, got.TokenExchange.SubjectTokenAudiences)
+				} else {
+					assert.Equal(t, tt.wantAud, got.TokenExchange.SubjectTokenAudiences)
+				}
+			}
+
+			var fromJSON DelegateClientRunConfig
+			require.NoError(t, json.Unmarshal([]byte(tt.json), &fromJSON))
+			check(t, fromJSON)
+			encoded, err := json.Marshal(fromJSON)
+			require.NoError(t, err)
+			var reJSON DelegateClientRunConfig
+			require.NoError(t, json.Unmarshal(encoded, &reJSON))
+			check(t, reJSON)
+
+			var fromYAML DelegateClientRunConfig
+			require.NoError(t, yaml.Unmarshal([]byte(tt.yaml), &fromYAML))
+			check(t, fromYAML)
+			encoded, err = yaml.Marshal(fromYAML)
+			require.NoError(t, err)
+			var reYAML DelegateClientRunConfig
+			require.NoError(t, yaml.Unmarshal(encoded, &reYAML))
+			check(t, reYAML)
+		})
+	}
+}
+
+func TestDelegateClientTokenExchangeClone(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		policy *DelegateClientTokenExchange
+	}{
+		{name: "nil policy clones to nil"},
+		{
+			name: "nil refresh block stays nil",
+			policy: &DelegateClientTokenExchange{
+				SelfIssuedSubjectTokens: SelfIssuedSubjectTokensRestricted,
+				AllowedSourceClients:    []string{"source-a"},
+			},
+		},
+		{
+			name: "refresh block, source clients and subject token audiences are not shared",
+			policy: &DelegateClientTokenExchange{
+				SelfIssuedSubjectTokens: SelfIssuedSubjectTokensRestricted,
+				AllowedSourceClients:    []string{"source-a", "source-b"},
+				SubjectTokenAudiences:   []string{"api-a", "api-b"},
+				ExchangeRefreshTokens: &DelegateClientExchangeRefreshTokens{
+					IDJAGMaxLifetime:        "1h",
+					RefreshTokenMaxLifetime: "12h",
+				},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			if tt.policy == nil {
+				assert.Nil(t, tt.policy.Clone())
+				return
+			}
+
+			clone := tt.policy.Clone()
+			require.NotNil(t, clone)
+			assert.Equal(t, tt.policy, clone)
+
+			wantSources := slices.Clone(tt.policy.AllowedSourceClients)
+			wantAudiences := slices.Clone(tt.policy.SubjectTokenAudiences)
+			var wantRefresh DelegateClientExchangeRefreshTokens
+			if tt.policy.ExchangeRefreshTokens == nil {
+				assert.Nil(t, clone.ExchangeRefreshTokens)
+			} else {
+				require.NotNil(t, clone.ExchangeRefreshTokens)
+				assert.NotSame(t, tt.policy.ExchangeRefreshTokens, clone.ExchangeRefreshTokens)
+				wantRefresh = *tt.policy.ExchangeRefreshTokens
+				clone.ExchangeRefreshTokens.IDJAGMaxLifetime = "2h"
+				clone.ExchangeRefreshTokens.RefreshTokenMaxLifetime = ""
+			}
+			if len(clone.AllowedSourceClients) > 0 {
+				clone.AllowedSourceClients[0] = "changed"
+				clone.AllowedSourceClients = append(clone.AllowedSourceClients, "added")
+			}
+			if len(clone.SubjectTokenAudiences) > 0 {
+				clone.SubjectTokenAudiences[0] = "changed"
+			}
+
+			if tt.policy.ExchangeRefreshTokens != nil {
+				assert.Equal(t, wantRefresh, *tt.policy.ExchangeRefreshTokens)
+			}
+			assert.Equal(t, wantSources, tt.policy.AllowedSourceClients)
+			assert.Equal(t, wantAudiences, tt.policy.SubjectTokenAudiences)
+		})
+	}
+}
+
+// spiffeBundleSourceTestTrust returns one trust domain using source and an
+// association that satisfies the grant requirement for it.
+func spiffeBundleSourceTestTrust(source SPIFFEBundleSourceRunConfig) ([]SPIFFETrustDomainRunConfig, *InboundGrantsRunConfig) {
+	domains := []SPIFFETrustDomainRunConfig{{
+		Name:         "production",
+		TrustDomain:  "example.org",
+		Methods:      []SPIFFEAuthenticationMethod{SPIFFEAuthenticationMethodX509},
+		BundleSource: source,
+	}}
+	grants := &InboundGrantsRunConfig{SPIFFEClientAuth: []SPIFFEClientAuthRunConfig{{
+		TrustDomainRef:   "production",
+		PrincipalPattern: "spiffe://example.org/ns/default/*",
+		ClientID:         "agent-client",
+		Methods:          []SPIFFEAuthenticationMethod{SPIFFEAuthenticationMethodX509},
+		Audiences:        []string{"https://mcp.example.com"},
+		Scopes:           []string{"openid"},
+		GrantTypes:       []string{SPIFFEGrantTypeTokenExchange},
+	}}}
+	return domains, grants
+}
+
+func TestSPIFFEBundleSourceRuntimeSupport(t *testing.T) {
+	t.Parallel()
+
+	const fileBundlePath = "/etc/spiffe/bundle.json"
+	httpsWebEndpoint := &SPIFFEBundleEndpointSourceRunConfig{
+		URL:     "https://spire.example.org/bundle",
+		Profile: SPIFFEBundleEndpointProfileHTTPSWeb,
+	}
+	httpsSPIFFEEndpoint := &SPIFFEBundleEndpointSourceRunConfig{
+		URL:     "https://spire.example.org/bundle",
+		Profile: SPIFFEBundleEndpointProfileHTTPSSPIFFE,
+	}
+
+	tests := []struct {
+		name    string
+		source  SPIFFEBundleSourceRunConfig
+		wantErr string
+	}{
+		{
+			name:   "file source accepted",
+			source: SPIFFEBundleSourceRunConfig{Type: SPIFFEBundleSourceTypeFile, File: &SPIFFEFileBundleSourceRunConfig{Path: fileBundlePath}},
+		},
+		{
+			name:    "bundle_endpoint with https_web rejected",
+			source:  SPIFFEBundleSourceRunConfig{Type: SPIFFEBundleSourceTypeEndpoint, Endpoint: httpsWebEndpoint},
+			wantErr: `type "bundle_endpoint" is not supported by this build; only "file" is supported`,
+		},
+		{
+			name:    "bundle_endpoint with https_spiffe rejected",
+			source:  SPIFFEBundleSourceRunConfig{Type: SPIFFEBundleSourceTypeEndpoint, Endpoint: httpsSPIFFEEndpoint},
+			wantErr: `type "bundle_endpoint" is not supported by this build; only "file" is supported`,
+		},
+		{
+			name:    "workload_api rejected",
+			source:  SPIFFEBundleSourceRunConfig{Type: SPIFFEBundleSourceTypeWorkloadAPI, WorkloadAPI: &SPIFFEWorkloadAPIBundleSourceRunConfig{}},
+			wantErr: `type "workload_api" is not supported by this build; only "file" is supported`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run("RunConfig/"+tt.name, func(t *testing.T) {
+			t.Parallel()
+			domains, grants := spiffeBundleSourceTestTrust(tt.source)
+			cfg := RunConfig{
+				Issuer:             "https://auth.example.org",
+				TLSListener:        &TLSListenerRunConfig{CertFile: "cert", KeyFile: "key"},
+				SPIFFETrustDomains: domains,
+				InboundGrants:      grants,
+			}
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, `spiffe_trust_domains[0] "production" bundle_source: `+tt.wantErr)
+		})
+
+		t.Run("Config/"+tt.name, func(t *testing.T) {
+			t.Parallel()
+			domains, grants := spiffeBundleSourceTestTrust(tt.source)
+			trust, err := NewSPIFFETrustConfig(
+				domains, grants, []string{"openid"}, []string{"https://mcp.example.com"},
+			)
+			require.NoError(t, err)
+			cfg := &Config{SPIFFETrust: trust}
+			err = cfg.validateRuntimeSPIFFEBundleSources()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.ErrorContains(t, err, `spiffe_trust: trust domain "example.org" bundle_source: `+tt.wantErr)
 		})
 	}
 }
