@@ -43,6 +43,23 @@ type ResponseFilteringWriter struct {
 	// the rewrite and its log line happen once whether Flush or FlushAndFilter
 	// reaches it first.
 	rejected bool
+	// streamWarn makes errorResponseBody log at WARN instead of ERROR. Only the
+	// GET event-stream writer sets it: a stream error is caused by upstream
+	// content, not by a server fault, and the POST path keeps its ERROR level.
+	streamWarn bool
+	// selectMethod, set only by the event-stream writer, names the list filter for a
+	// clean response from its result shape when method is "". Nil on the POST path.
+	selectMethod func(result json.RawMessage) (string, error)
+}
+
+// responseMethod returns the list filter for a clean response. A writer with a fixed
+// method answers that method. A writer without one asks selectMethod, so the shape
+// rules are supplied by the caller that set it and applied in one place.
+func (rfw *ResponseFilteringWriter) responseMethod(response *jsonrpc2.Response) (string, error) {
+	if rfw.method != "" || rfw.selectMethod == nil {
+		return rfw.method, nil
+	}
+	return rfw.selectMethod(response.Result)
 }
 
 // NewResponseFilteringWriter creates a new response filtering writer.
@@ -425,7 +442,8 @@ func assembleSSEEvent(event []sseLine) (dataValues [][]byte, assembled []byte, l
 
 // resolveAssembled filters an event whose lone-CR check and data join were already
 // done by the caller. dataValues and assembled are that join: assembled is non-empty.
-// The GET stream's filterEvent calls it directly, so those checks run once per event.
+// The GET stream's filterEvent calls it for frames that are not a clean Response, so
+// those checks run once per event.
 func (rfw *ResponseFilteringWriter) resolveAssembled(event []sseLine, dataValues [][]byte, assembled []byte) []sseLine {
 	replacement, failedClosed := rfw.filterSSEEventData(assembled)
 	if replacement == nil {
@@ -435,6 +453,20 @@ func (rfw *ResponseFilteringWriter) resolveAssembled(event []sseLine, dataValues
 		return event
 	}
 	return rebuildEventWithPayload(event, replacement, failedClosed)
+}
+
+// resolveDecodedResponse is resolveAssembled for an event whose payload the caller
+// already decoded as a clean Response with a list or find_tool result. It filters
+// that response directly, so the payload is not decoded a second time. The failure
+// is logged once here, and the client gets the generic error body.
+func (rfw *ResponseFilteringWriter) resolveDecodedResponse(event []sseLine, response *jsonrpc2.Response) []sseLine {
+	filteredData, ferr := rfw.filterAndEncode(response)
+	if ferr != nil {
+		slog.Warn("emitting a JSON-RPC error in place of an SSE frame that failed to filter",
+			"method", rfw.method, "error", ferr)
+		return rebuildEventWithPayload(event, encodeErrorBody(response.ID), true)
+	}
+	return rebuildEventWithPayload(event, filteredData, false)
 }
 
 // errorEventLines replaces a whole event with one `data:` line carrying body. It is
@@ -694,23 +726,33 @@ const (
 // its response filter. Keeping eligibility and dispatch behind this one mapping
 // prevents a protected list method from being intercepted but passed through
 // because it was added to only one of two method lists.
+// listKind is one list result: the member that names it in a result, the method
+// whose response it answers, and the filter that scrubs it. listKinds is the only
+// table that lists them; the GET stream's member map is derived from it.
+type listKind struct {
+	member string
+	method string
+	kind   responseFilterKind
+}
+
+var listKinds = []listKind{
+	{member: "tools", method: string(mcp.MethodToolsList), kind: responseFilterTools},
+	{member: "prompts", method: string(mcp.MethodPromptsList), kind: responseFilterPrompts},
+	{member: "resources", method: string(mcp.MethodResourcesList), kind: responseFilterResources},
+	{member: "resourceTemplates", method: string(mcp.MethodResourcesTemplatesList), kind: responseFilterResourceTemplates},
+	{member: "skills", method: "skills/list", kind: responseFilterSkills},
+}
+
 func responseFilterForMethod(method string) responseFilterKind {
-	switch method {
-	case string(mcp.MethodToolsList):
-		return responseFilterTools
-	case string(mcp.MethodPromptsList):
-		return responseFilterPrompts
-	case string(mcp.MethodResourcesList):
-		return responseFilterResources
-	case string(mcp.MethodResourcesTemplatesList):
-		return responseFilterResourceTemplates
-	case "skills/list":
-		return responseFilterSkills
-	case optimizerdec.FindToolName:
-		return responseFilterFindTool
-	default:
-		return responseFilterNone
+	for _, lk := range listKinds {
+		if lk.method == method {
+			return lk.kind
+		}
 	}
+	if method == optimizerdec.FindToolName {
+		return responseFilterFindTool
+	}
+	return responseFilterNone
 }
 
 // requiresResponseFiltering reports whether the method needs response filtering.
@@ -1482,7 +1524,11 @@ func (rfw *ResponseFilteringWriter) filterSkillsResponse(response *jsonrpc2.Resp
 // their body here, so neither can leak it. id is echoed so the client can
 // correlate the error with its request.
 func (rfw *ResponseFilteringWriter) errorResponseBody(id jsonrpc2.ID, err error) []byte {
-	slog.Error("error filtering response", "method", rfw.method, "error", err)
+	if rfw.streamWarn {
+		slog.Warn("error filtering response", "method", rfw.method, "error", err)
+	} else {
+		slog.Error("error filtering response", "method", rfw.method, "error", err)
+	}
 	return encodeErrorBody(id)
 }
 
